@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  # ── MongoDB ──
+  mongodb:
+    image: mongo:7.0
+    container_name: bifrost-mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - ./mongo-init.js:/docker-entrypoint-initdb.d/init.js:ro
+    environment:
+      MONGO_INITDB_DATABASE: bifrost-indexer
+    restart: unless-stopped
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── MongoDB UI (optional, xóa nếu không cần) ──
+  mongo-express:
+    image: mongo-express:latest
+    container_name: bifrost-mongo-ui
+    ports:
+      - "8081:8081"
+    environment:
+      ME_CONFIG_MONGODB_URL: mongodb://mongodb:27017/
+      ME_CONFIG_BASICAUTH: "false"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── NestJS App ──
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bifrost-indexer-app
+    ports:
+      - "3000:3000"
+    environment:
+      MONGODB_URI: mongodb://mongodb:27017/bifrost-indexer
+      PORT: 3000
+      NODE_ENV: production
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      # Mount để hot reload trong dev
+      - ./src:/app/src:ro
+
+volumes:
+  mongodb_data:
+    driver: local

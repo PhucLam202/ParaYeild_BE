@@ -8,8 +8,7 @@ import { ThrottlerGuard } from '@nestjs/throttler';
 import { Reflector } from '@nestjs/core';
 
 import configuration from './config/configuration';
-import { IndexerModule } from './modules/indexer/indexer.module';
-import { ApyModule } from './modules/apy/apy.module';
+import { PriceIndexerModule } from './modules/price-indexer/price-indexer.module';
 import { SimulationModule } from './modules/simulation/simulation.module';
 import { LoggerModule } from './modules/logger/logger.module';
 import { HealthController } from './health.controller';
@@ -52,8 +51,7 @@ import { HealthController } from './health.controller';
 
         // ─── Feature modules ───
         LoggerModule,
-        IndexerModule,
-        ApyModule,
+        PriceIndexerModule,
         SimulationModule,
     ],
 

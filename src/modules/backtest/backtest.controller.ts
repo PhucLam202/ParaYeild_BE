@@ -29,6 +29,7 @@ import {
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { BacktestService } from './backtest.service';
+import { StrategyService } from './strategy.service';
 import { Public } from '../../common/decorators/public.decorator';
 
 // ─── DTO classes for Swagger + validation ────────────────────────────────────
@@ -116,12 +117,84 @@ class RunBacktestDto {
     xcmFeeUsd?: number;
 }
 
+// ─── Extra DTOs ──────────────────────────────────────────────────────────────
+
+class SuggestStrategiesQueryDto {
+    @ApiProperty({
+        enum: ['low', 'medium', 'high'],
+        required: false,
+        description: 'Filter suggestions by risk level',
+    })
+    @IsOptional()
+    @IsEnum(['low', 'medium', 'high'])
+    riskLevel?: 'low' | 'medium' | 'high';
+
+    @ApiProperty({
+        required: false,
+        example: 5,
+        description: 'Only include chains with estimated APY min >= this value',
+    })
+    @IsOptional()
+    @IsNumber()
+    @Min(0)
+    @Type(() => Number)
+    minApy?: number;
+
+    @ApiProperty({
+        required: false,
+        example: false,
+        description: 'Set to true to bypass 5-min cache and force LLM re-generation',
+    })
+    @IsOptional()
+    @IsBoolean()
+    @Type(() => Boolean)
+    refresh?: boolean;
+}
+
 // ─── Controller ───────────────────────────────────────────────────────────────
 
 @ApiTags('Backtest')
 @Controller('backtest')
 export class BacktestController {
-    constructor(private readonly backtestService: BacktestService) { }
+    constructor(
+        private readonly backtestService: BacktestService,
+        private readonly strategyService: StrategyService,
+    ) { }
+
+    /**
+     * GET /api/v1/backtest/suggest-strategies
+     * Use LLM to analyse current pools and generate investment chain suggestions.
+     */
+    @Get('suggest-strategies')
+    @Public()
+    @ApiOperation({
+        summary: '🤖 Gợi ý chuỗi đầu tư tối ưu bằng AI',
+        description: `
+Gọi OpenAI để phân tích các pool hiện tại và tạo ra các **chuỗi đầu tư đề xuất**.
+
+Mỗi chain bao gồm:
+- Danh sách allocations (protocol + asset + %) sẵn sàng truyền vào \`POST /backtest/run\`
+- Ước tính APY tổng hợp
+- Mức rủi ro (low / medium / high)
+- Lý giải từ AI
+
+**Cache:** Kết quả được cache 5 phút để tiết kiệm token. Dùng \`?refresh=true\` để force regenerate.
+        `,
+    })
+    @ApiQuery({ name: 'riskLevel', required: false, enum: ['low', 'medium', 'high'] })
+    @ApiQuery({ name: 'minApy', required: false, type: Number, example: 5 })
+    @ApiQuery({ name: 'refresh', required: false, type: Boolean, example: false })
+    async suggestStrategies(
+        @Query('riskLevel') riskLevel?: 'low' | 'medium' | 'high',
+        @Query('minApy') minApy?: number,
+        @Query('refresh') refresh?: string,
+    ) {
+        const parsedMinApy = minApy !== undefined && !isNaN(Number(minApy)) ? Number(minApy) : undefined;
+        return this.strategyService.suggestStrategies(
+            { riskLevel, minApy: parsedMinApy },
+            refresh === 'true',
+        );
+    }
 
     /**
      * GET /api/v1/backtest/apy-history

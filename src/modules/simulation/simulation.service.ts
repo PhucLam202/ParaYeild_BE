@@ -17,17 +17,81 @@ export interface RunSimulationDto {
     allocations: SimulationAllocation[];
 }
 
+// Core Polkadot-ecosystem tokens — pools must contain at least one of these
+const CORE_TOKENS = new Set([
+    'dot', 'vdot', 'ldot',
+    'bnc', 'vbnc',
+    'eth', 'veth',
+    'ksm', 'vksm',
+    'glmr', 'vglmr',
+    'astr', 'vastr',
+    'aca',
+    'movr',
+    'usdt', 'usdc',
+]);
+
+function hasCoreToken(assetSymbol: string): boolean {
+    const lower = assetSymbol.toLowerCase();
+    for (const token of CORE_TOKENS) {
+        // Match whole token name separated by '-', '/', or at start/end of string
+        const re = new RegExp(`(^|[-/])${token}($|[-/])`);
+        if (re.test(lower) || lower === token) return true;
+    }
+    return false;
+}
+
 @Injectable()
 export class SimulationService {
     private readonly logger = new Logger(SimulationService.name);
 
     constructor(private readonly poolsClient: PoolsClientService) { }
 
-    // ─── Proxy: lấy danh sách pools từ server ngoài ───
+    // ─── Proxy: lấy danh sách pools, chỉ giữ token chính Polkadot ecosystem ───
     async fetchPools(params: PoolsQueryParams) {
-        return this.poolsClient.fetchPools(params);
+        const result = await this.poolsClient.fetchPools(params);
+        let filtered = (result.data || []).filter((p) => hasCoreToken(p.assetSymbol));
+
+        // In-memory protocol filter — external API filter may be unreliable
+        if (params.protocol) {
+            const proto = params.protocol.toLowerCase();
+            filtered = filtered.filter((p) => p.protocol.toLowerCase() === proto);
+        }
+
+        return { ...result, count: filtered.length, data: filtered };
     }
 
+    // ─── GET List filters (internal call) ───
+    // Polkadot-native parachains only — excludes non-Polkadot networks like Base (Ethereum L2)
+    private readonly EXCLUDED_NETWORKS = new Set(['base']);
+
+    async getParachains() {
+        const response = await this.poolsClient.fetchParachains();
+        const all: any[] = response?.data || [];
+        return all.filter((p) => !this.EXCLUDED_NETWORKS.has(p.id?.toLowerCase()));
+    }
+
+    async getProtocolTypes() {
+        const response = await this.poolsClient.fetchProtocolTypes();
+        return response?.data || [];
+    }
+
+    async getTokens() {
+        const response = await this.poolsClient.fetchTokens();
+        return response?.data || [];
+    }
+
+    async getProtocols() {
+        // Extract protocols from tokens endpoint since there isn't a dedicated endpoint mentioned.
+        const response = await this.poolsClient.fetchTokens();
+        const allTokens = response?.data || [];
+        const protocols = new Set<string>();
+        for (const t of allTokens) {
+            if (t.protocols) {
+                t.protocols.forEach(p => protocols.add(p));
+            }
+        }
+        return Array.from(protocols).sort();
+    }
     // ─── Quick simulation (static APY – fast preview) ───
     async runSimulation(dto: RunSimulationDto) {
         const { initialAmountUsd, from, to, allocations } = dto;

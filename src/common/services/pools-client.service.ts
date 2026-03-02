@@ -111,4 +111,40 @@ export class PoolsClientService {
             throw new BadRequestException(`Cannot reach pools history server: ${err.message}`);
         }
     }
+
+    // ─── GET /pools/parachains ───
+    async fetchParachains(): Promise<any> {
+        const url = `${this.baseUrl}/pools/parachains`;
+        try {
+            const resp = await axios.get(url, { timeout: 10000 });
+            return resp.data;
+        } catch (err) {
+            this.logger.error(`fetchParachains failed: ${err.message}`);
+            throw new BadRequestException(`Cannot reach pools server: ${err.message}`);
+        }
+    }
+
+    // ─── GET /pools/protocol-types ───
+    async fetchProtocolTypes(): Promise<any> {
+        const url = `${this.baseUrl}/pools/protocol-types`;
+        try {
+            const resp = await axios.get(url, { timeout: 10000 });
+            return resp.data;
+        } catch (err) {
+            this.logger.error(`fetchProtocolTypes failed: ${err.message}`);
+            throw new BadRequestException(`Cannot reach pools server: ${err.message}`);
+        }
+    }
+
+    // ─── GET /pools/tokens ───
+    async fetchTokens(): Promise<any> {
+        const url = `${this.baseUrl}/pools/tokens`;
+        try {
+            const resp = await axios.get(url, { timeout: 10000 });
+            return resp.data;
+        } catch (err) {
+            this.logger.error(`fetchTokens failed: ${err.message}`);
+            throw new BadRequestException(`Cannot reach pools server: ${err.message}`);
+        }
+    }
 }

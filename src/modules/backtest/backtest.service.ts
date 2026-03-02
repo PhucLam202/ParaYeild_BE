@@ -24,6 +24,8 @@ export interface RunBacktestDto {
     compoundFrequency?: 'daily' | 'weekly' | 'monthly';
     includeIL?: boolean;
     xcmFeeUsd?: number; // fee per rebalance event
+    isCompound?: boolean; // toggle daily compounding
+    slippageTolerancePercent?: number; // 0-5% usually
 }
 
 // ─── Internal types ──────────────────────────────────────────────────────────
@@ -44,6 +46,7 @@ interface AllocState {
     apySamples: number[]; // all daily APYs seen
     ilLossUsd: number;
     dataSource: string; // which protocol/asset data was actually used
+    accruedRewardsUsd: number; // accumulated yield if NOT compounding
 }
 
 // ─── Service ─────────────────────────────────────────────────────────────────
@@ -76,6 +79,8 @@ export class BacktestService {
             rebalanceIntervalDays = 0,
             includeIL = false,
             xcmFeeUsd = 0.5,
+            isCompound = true, // default to true as it was before
+            slippageTolerancePercent = 0,
         } = dto;
 
         // ── Validation ──
@@ -183,12 +188,14 @@ export class BacktestService {
                 assetSymbol: alloc.assetSymbol,
                 poolType: alloc.poolType ?? 'unknown',
                 percentage: alloc.percentage,
-                valueUsd: initialAmountUsd * (alloc.percentage / 100),
+                // Initial slippage applied:
+                valueUsd: (initialAmountUsd * (alloc.percentage / 100)) * (1 - slippageTolerancePercent / 100),
                 apyHistory,
                 firstPrice: undefined,
                 apySamples: [],
                 ilLossUsd: 0,
                 dataSource,
+                accruedRewardsUsd: 0,
             };
         });
 
@@ -197,6 +204,7 @@ export class BacktestService {
         let peakValue = initialAmountUsd;
         let maxDrawdown = 0;
         let xcmFeesPaidUsd = 0;
+        let slippageCostUsd = initialAmountUsd * (slippageTolerancePercent / 100); // Initial slippage
         let rebalanceCount = 0;
         let prevTotalValue = initialAmountUsd;
 
@@ -209,9 +217,14 @@ export class BacktestService {
                 state.apySamples.push(apy);
 
                 if (i > 0) {
-                    // Compound daily: value *= (1 + APY%/365/100)
                     const dailyRate = apy / 100 / 365;
-                    state.valueUsd *= (1 + dailyRate);
+                    if (isCompound) {
+                        // Compound daily: value grows
+                        state.valueUsd *= (1 + dailyRate);
+                    } else {
+                        // No compound: yield added to separate bucket
+                        state.accruedRewardsUsd += state.valueUsd * dailyRate;
+                    }
                 }
             }
 
@@ -231,18 +244,34 @@ export class BacktestService {
 
                 const totalAfterFees = totalBefore - feesThisRebalance;
 
+                // Calculate rebalance target values to determine swap volumes
+                let totalSlippageCostThisRebalance = 0;
+                for (const state of allocStates) {
+                    const targetValue = totalAfterFees * (state.percentage / 100);
+                    const tradeVolume = Math.abs(state.valueUsd - targetValue);
+                    const slippageForThisAsset = tradeVolume * (slippageTolerancePercent / 100);
+                    totalSlippageCostThisRebalance += slippageForThisAsset;
+                }
+
+                // Because every trade has two sides (sell A, buy B), real portfolio-level
+                // slippage cost is half of the sum of individually calculated slippages.
+                totalSlippageCostThisRebalance = totalSlippageCostThisRebalance / 2;
+                slippageCostUsd += totalSlippageCostThisRebalance;
+
+                const totalAfterSlippage = totalAfterFees - totalSlippageCostThisRebalance;
+
                 // Re-distribute according to original percentages
                 for (const state of allocStates) {
-                    state.valueUsd = totalAfterFees * (state.percentage / 100);
+                    state.valueUsd = totalAfterSlippage * (state.percentage / 100);
                 }
 
                 this.logger.debug(
-                    `Rebalance on ${dateStr}: total=${totalBefore.toFixed(2)}, fees=${feesThisRebalance.toFixed(2)}`,
+                    `Rebalance on ${dateStr}: total=${totalBefore.toFixed(2)}, fees=${feesThisRebalance.toFixed(2)}, slippage=${totalSlippageCostThisRebalance.toFixed(2)}`,
                 );
             }
 
             // ── Snapshot portfolio value ──
-            const totalValue = allocStates.reduce((s, a) => s + a.valueUsd, 0);
+            const totalValue = allocStates.reduce((s, a) => s + a.valueUsd + a.accruedRewardsUsd, 0);
             const dailyReturnPct = i === 0 ? 0 : ((totalValue - prevTotalValue) / prevTotalValue) * 100;
             prevTotalValue = totalValue;
 
@@ -316,9 +345,10 @@ export class BacktestService {
                 minApyPercent: parseFloat(minApy.toFixed(4)),
                 maxApyPercent: parseFloat(maxApy.toFixed(4)),
                 ilLossUsd: state.ilLossUsd,
-                finalUsd: parseFloat(state.valueUsd.toFixed(4)),
-                returnUsd: parseFloat(returnUsd.toFixed(4)),
-                returnPercent: parseFloat(returnPct.toFixed(4)),
+                finalUsd: parseFloat((state.valueUsd + state.accruedRewardsUsd).toFixed(4)),
+                returnUsd: parseFloat((state.valueUsd + state.accruedRewardsUsd - allocatedUsd).toFixed(4)),
+                returnPercent: parseFloat(((state.valueUsd + state.accruedRewardsUsd - allocatedUsd) / allocatedUsd * 100).toFixed(4)),
+                accruedRewardsUsd: parseFloat(state.accruedRewardsUsd.toFixed(4)),
                 dataPointsUsed: state.apySamples.length,
                 hasHistoricalData,
                 ...(!hasHistoricalData && {
@@ -341,7 +371,10 @@ export class BacktestService {
                 to: toDate.toISOString(),
                 rebalancedCount: rebalanceCount,
                 xcmFeesPaidUsd: parseFloat(xcmFeesPaidUsd.toFixed(4)),
+                slippageCostUsd: parseFloat(slippageCostUsd.toFixed(4)),
                 ilIncluded: includeIL,
+                isCompound,
+                slippageTolerancePercent,
             },
             breakdown,
             // Cap timeSeries at 500 points for UI charts

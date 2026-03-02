@@ -115,6 +115,26 @@ class RunBacktestDto {
     @IsNumber()
     @Min(0)
     xcmFeeUsd?: number;
+
+    @ApiProperty({
+        example: true,
+        required: false,
+        description: 'Auto-compound/Reinvest rewards into the principal.',
+    })
+    @IsOptional()
+    @IsBoolean()
+    isCompound?: boolean;
+
+    @ApiProperty({
+        example: 0.5,
+        required: false,
+        description: 'Slippage tolerance % applied on initial deployment and rebalancing.',
+    })
+    @IsOptional()
+    @IsNumber()
+    @Min(0)
+    @Max(5)
+    slippageTolerancePercent?: number;
 }
 
 // ─── Extra DTOs ──────────────────────────────────────────────────────────────

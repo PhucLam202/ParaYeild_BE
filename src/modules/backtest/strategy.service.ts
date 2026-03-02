@@ -1,8 +1,12 @@
-import { Injectable, Logger, InternalServerErrorException } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Interval } from '@nestjs/schedule';
 import { ConfigService } from '@nestjs/config';
+import { MongoRepository } from 'typeorm';
 import OpenAI from 'openai';
 import { v4 as uuidv4 } from 'uuid';
 import { PoolsClientService, PoolSnapshot } from '../../common/services/pools-client.service';
+import { StrategyCache } from '../../entities';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -13,6 +17,13 @@ export interface StrategyAllocation {
     poolType: string;
     apyMin: number;
     apyMax: number;
+    // Live pool detail — populated from pool snapshot after LLM generation
+    network?: string;
+    tvlUsd?: number;
+    currentApy?: number;  // totalApy from live data
+    supplyApy?: number;
+    rewardApy?: number;
+    dataTimestamp?: string;
 }
 
 export interface InvestmentChain {
@@ -46,15 +57,19 @@ interface CacheEntry {
 // ─── Service ──────────────────────────────────────────────────────────────────
 
 @Injectable()
-export class StrategyService {
+export class StrategyService implements OnModuleInit {
     private readonly logger = new Logger(StrategyService.name);
     private readonly openai: OpenAI | null;
-    private readonly CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+    private readonly CACHE_TTL_MS = 60 * 60 * 1000; // 60 min (cron refresh every 30 min)
     private cache: CacheEntry | null = null;
+    /** Shared promise to prevent concurrent LLM calls */
+    private refreshPromise: Promise<void> | null = null;
 
     constructor(
         private readonly poolsClient: PoolsClientService,
         private readonly configService: ConfigService,
+        @InjectRepository(StrategyCache)
+        private readonly cacheRepo: MongoRepository<StrategyCache>,
     ) {
         const apiKey = this.configService.get<string>('openaiApiKey');
         if (apiKey) {
@@ -66,19 +81,82 @@ export class StrategyService {
         }
     }
 
+    /** Load from MongoDB on startup; fall back to LLM if missing/expired */
+    async onModuleInit() {
+        this.logger.log('Initializing strategy cache — checking MongoDB...');
+        try {
+            const cached = await this.cacheRepo.findOne({ where: { cacheKey: 'strategies' } });
+            if (cached && new Date() < cached.expiresAt) {
+                this.cache = {
+                    data: cached.data as SuggestStrategiesResult,
+                    expiresAt: cached.expiresAt.getTime(),
+                };
+                this.logger.log(`Strategy cache loaded from MongoDB (expires ${cached.expiresAt.toISOString()})`);
+                return;
+            }
+            this.logger.log('MongoDB cache missing/expired — scheduling LLM refresh');
+        } catch (err) {
+            this.logger.error(`MongoDB cache load failed: ${err.message} — falling back to LLM`);
+        }
+        this.scheduleRefresh();
+    }
+
     // ─── Public API ──────────────────────────────────────────────────────────
 
     async suggestStrategies(
         filter: SuggestFilter = {},
         forceRefresh = false,
     ): Promise<SuggestStrategiesResult> {
-        // Return cached result if valid and not forced refresh
-        if (!forceRefresh && this.cache && Date.now() < this.cache.expiresAt) {
-            this.logger.debug('Returning cached strategy suggestions');
+        const cacheExpired = !this.cache || Date.now() >= this.cache.expiresAt;
+
+        // Trigger a background refresh when needed (stale-while-revalidate)
+        if ((cacheExpired || forceRefresh) && !this.refreshPromise) {
+            this.scheduleRefresh();
+        }
+
+        // Serve stale/cached data immediately — no waiting for LLM
+        if (this.cache) {
+            if (!cacheExpired) {
+                this.logger.debug('Returning fresh cached strategy suggestions');
+            } else {
+                this.logger.debug('Cache stale — returning cached data, refreshing in background');
+            }
             return this.applyFilter(this.cache.data, filter);
         }
 
-        // 1. Fetch current pools
+        // No cache at all (first startup before warm-up completes): wait for the in-flight refresh
+        this.logger.log('No cache yet — awaiting initial strategy generation...');
+        if (this.refreshPromise) {
+            await this.refreshPromise;
+        }
+
+        if (this.cache) {
+            return this.applyFilter(this.cache.data, filter);
+        }
+
+        // Absolute fallback if LLM + pool fetch both failed
+        return this.applyFilter(this.buildFallbackResult(0), filter);
+    }
+
+    // ─── Background refresh ───────────────────────────────────────────────────
+
+    private scheduleRefresh(): void {
+        this.refreshPromise = this.doRefresh().finally(() => {
+            this.refreshPromise = null;
+        });
+    }
+
+    @Interval(30 * 60 * 1000)
+    handleStrategyRefreshCron(): void {
+        this.logger.log('[Cron] 30-min strategy auto-refresh triggered');
+        if (!this.refreshPromise) {
+            this.scheduleRefresh();
+        } else {
+            this.logger.debug('[Cron] Refresh already in progress — skipping');
+        }
+    }
+
+    private async doRefresh(): Promise<void> {
         let pools: PoolSnapshot[] = [];
         let totalPools = 0;
         try {
@@ -86,19 +164,15 @@ export class StrategyService {
             pools = resp.data ?? [];
             totalPools = resp.count ?? pools.length;
         } catch (err) {
-            this.logger.error(`Failed to fetch pools: ${err.message}`);
-            throw new InternalServerErrorException(
-                'Cannot fetch pool data for strategy generation. Is the pools server running?',
-            );
+            this.logger.error(`[refresh] Failed to fetch pools: ${err.message}`);
+            return;
         }
 
         if (pools.length === 0) {
-            this.logger.warn('No pools found — returning fallback strategies');
-            const fallback = this.buildFallbackResult(0);
-            return this.applyFilter(fallback, filter);
+            this.logger.warn('[refresh] No pools found — skipping LLM refresh');
+            return;
         }
 
-        // 2. Generate chains via LLM or fallback
         let chains: InvestmentChain[];
         if (this.openai) {
             chains = await this.generateWithLLM(pools);
@@ -106,23 +180,74 @@ export class StrategyService {
             chains = this.buildFallbackChains(pools);
         }
 
+        chains = this.enrichChainsWithPoolData(chains, pools);
+
+        // Enforce minimum 2 valid chains regardless of LLM output
+        const validChains = chains.filter((c) => c.id !== 'error-chain-fallback');
+        if (validChains.length < 2) {
+            this.logger.warn(`[refresh] Only ${validChains.length} valid chains from LLM — supplementing with fallback`);
+            const fallback = this.enrichChainsWithPoolData(this.buildFallbackChains(pools), pools);
+            chains = [...validChains, ...fallback].slice(0, Math.max(validChains.length + fallback.length, 2));
+        }
+
         const result: SuggestStrategiesResult = {
             generatedAt: new Date().toISOString(),
             totalPools,
             chains,
         };
+        this.cache = {
+            data: result,
+            expiresAt: Date.now() + this.CACHE_TTL_MS,
+        };
+        this.logger.log('Strategy cache refreshed successfully');
 
-        // 3. Cache the full result
-        this.cache = { data: result, expiresAt: Date.now() + this.CACHE_TTL_MS };
+        // Persist to MongoDB — fire-and-forget, does not block serving
+        this.persistToDb(result).catch((err) =>
+            this.logger.error(`[persistToDb] MongoDB save failed: ${err.message}`)
+        );
+    }
 
-        return this.applyFilter(result, filter);
+    private async persistToDb(result: SuggestStrategiesResult): Promise<void> {
+        const expiresAt = new Date(Date.now() + this.CACHE_TTL_MS);
+        await this.cacheRepo.updateOne(
+            { cacheKey: 'strategies' },
+            {
+                $set: {
+                    cacheKey: 'strategies',
+                    data: result as unknown as Record<string, any>,
+                    expiresAt,
+                    generatedAt: new Date(result.generatedAt),
+                    updatedAt: new Date(),
+                },
+            },
+            { upsert: true },
+        );
+        this.logger.log(`Strategy cache persisted to MongoDB (expires ${expiresAt.toISOString()})`);
     }
 
     // ─── LLM generation ──────────────────────────────────────────────────────
 
     private async generateWithLLM(pools: PoolSnapshot[]): Promise<InvestmentChain[]> {
-        const poolLines = pools
-            .slice(0, 40) // limit context size
+        // Remove outlier pools: APY > 300% with TVL < $50k are likely anomalous/illiquid
+        const sanitised = pools.filter((p) => {
+            const apy = p.totalApy ?? p.supplyApy ?? 0;
+            const tvl = p.tvlUsd ?? 0;
+            if (apy > 300 && tvl < 50_000) return false;
+            return true;
+        });
+
+        // Cap 5 pools per protocol to ensure cross-protocol diversity
+        const protocolCount = new Map<string, number>();
+        const diverse = sanitised.filter((p) => {
+            const key = p.protocol.toLowerCase();
+            const count = protocolCount.get(key) ?? 0;
+            if (count >= 5) return false;
+            protocolCount.set(key, count + 1);
+            return true;
+        });
+
+        const poolLines = diverse
+            .slice(0, 30)
             .map((p) => {
                 const apy = p.totalApy ?? p.supplyApy ?? 0;
                 return `- protocol=${p.protocol} asset=${p.assetSymbol} poolType=${p.poolType} apy=${apy.toFixed(2)}% tvl=${p.tvlUsd ? `$${Math.round(p.tvlUsd / 1000)}k` : 'N/A'}`;
@@ -130,10 +255,11 @@ export class StrategyService {
             .join('\n');
 
         const systemPrompt = `You are a DeFi investment strategist specializing in Polkadot parachains.
-Your task is to analyze a list of liquidity pools and suggest 6–8 diversified investment chains.
+Your task is to analyze a list of liquidity pools and generate EXACTLY 6 investment chains — no more, no less.
 Each chain combines 2-3 pools with percentage allocations that MUST sum to exactly 100.
-Prefer chains that balance risk (vstaking = low risk, dex = medium risk, farming = higher risk).
-Respond ONLY with a valid JSON object containing a "chains" array. No markdown, no explanation — pure JSON.`;
+You MUST include chains at each risk level: at least 2 low-risk, 2 medium-risk, and 2 high-risk chains.
+You MUST diversify across protocols: each chain should ideally combine pools from different protocols (e.g. Bifrost + Hydration, not Hydration + Hydration). Avoid using the same protocol for all allocations in a chain unless no alternatives exist.
+Respond ONLY with a valid JSON object containing a "chains" array with exactly 6 items. No markdown, no explanation — pure JSON.`;
 
         const userPrompt = `Here are the current available pools (sorted by APY desc):
 
@@ -169,17 +295,19 @@ Rules:
 - Vary risk levels: some low, some medium, some high chains
 - apyMin/apyMax should reflect realistic range based on the pool data provided
 - estimatedApyMin/Max = weighted average of allocation apyMin/Max
-- Use exact protocol names and assetSymbols from the pool list above`;
+- Use exact protocol names and assetSymbols from the pool list above
+- You MUST generate EXACTLY 6 chains — never fewer. If needed, reuse pools in different combinations with different percentages.
+- Ensure risk level diversity: 2 low-risk chains, 2 medium-risk chains, 2 high-risk chains.`;
 
         try {
             this.logger.log('Calling OpenAI for strategy suggestions...');
             const response = await this.openai!.chat.completions.create({
-                model: 'gpt-5-nano',
+                model: 'gpt-4o-mini',
                 messages: [
                     { role: 'system', content: systemPrompt },
                     { role: 'user', content: userPrompt },
                 ],
-                max_completion_tokens: 10000,
+                max_completion_tokens: 4096,
                 response_format: { type: 'json_object' },
             });
 
@@ -227,6 +355,43 @@ Rules:
     }
 
     // ─── Helpers ─────────────────────────────────────────────────────────────
+
+    /**
+     * Match each allocation back to its source pool snapshot and attach live
+     * fields: network, tvlUsd, currentApy, supplyApy, rewardApy, dataTimestamp.
+     */
+    private enrichChainsWithPoolData(chains: InvestmentChain[], pools: PoolSnapshot[]): InvestmentChain[] {
+        // Build lookup: "protocol|assetSymbol" → best matching pool
+        const poolMap = new Map<string, PoolSnapshot>();
+        for (const pool of pools) {
+            const key = `${pool.protocol.toLowerCase()}|${pool.assetSymbol.toLowerCase()}`;
+            // Keep the entry with higher APY when duplicates exist
+            const existing = poolMap.get(key);
+            const apy = pool.totalApy ?? pool.supplyApy ?? 0;
+            const existingApy = existing ? (existing.totalApy ?? existing.supplyApy ?? 0) : -1;
+            if (!existing || apy > existingApy) {
+                poolMap.set(key, pool);
+            }
+        }
+
+        return chains.map((chain) => ({
+            ...chain,
+            allocations: chain.allocations.map((alloc) => {
+                const key = `${alloc.protocol.toLowerCase()}|${alloc.assetSymbol.toLowerCase()}`;
+                const pool = poolMap.get(key);
+                if (!pool) return alloc;
+                return {
+                    ...alloc,
+                    network: pool.network,
+                    tvlUsd: pool.tvlUsd,
+                    currentApy: pool.totalApy ?? pool.supplyApy,
+                    supplyApy: pool.supplyApy,
+                    rewardApy: pool.rewardApy,
+                    dataTimestamp: pool.dataTimestamp,
+                };
+            }),
+        }));
+    }
 
     /**
      * Normalise & validate one LLM-generated chain.

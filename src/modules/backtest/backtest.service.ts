@@ -2,6 +2,7 @@ import {
     Injectable,
     Logger,
     BadRequestException,
+    HttpException,
 } from '@nestjs/common';
 import { PoolsClientService, PoolHistoryRecord } from '../../common/services/pools-client.service';
 
@@ -42,6 +43,7 @@ interface AllocState {
     firstPrice?: number; // for IL calculation (price on day 0)
     apySamples: number[]; // all daily APYs seen
     ilLossUsd: number;
+    dataSource: string; // which protocol/asset data was actually used
 }
 
 // ─── Service ─────────────────────────────────────────────────────────────────
@@ -97,40 +99,84 @@ export class BacktestService {
         const days = this.buildDayList(fromDate, toDate);
         const durationDays = days.length - 1;
 
-        // ── Fetch historical APY — group by protocol to minimize requests ──
-        // External server may not filter by asset client-side, so we fetch
-        // all records per protocol and filter by assetSymbol ourselves.
-        const protocolsNeeded = [...new Set(allocations.map((a) => a.protocol))];
-        const protocolHistoryCache: Record<string, PoolHistoryRecord[]> = {};
+        // ── Step A: Validate allocations against known pool catalog ──────────────────
+        const tokenResp = await this.poolsClient.fetchTokens();
+        const tokenCatalog = (tokenResp?.data || []) as Array<{
+            symbol: string; protocols: string[]; poolTypes: string[];
+        }>;
+        const tokenMap = new Map(tokenCatalog.map(t => [t.symbol, t]));
 
-        await Promise.all(
-            protocolsNeeded.map(async (proto) => {
-                try {
-                    const resp = await this.poolsClient.fetchPoolHistory({
-                        protocol: proto,
-                        from,
-                        to,
-                    });
-                    protocolHistoryCache[proto] = resp.data ?? [];
-                    this.logger.debug(
-                        `[${proto}] fetched ${protocolHistoryCache[proto].length} total history records`,
-                    );
-                } catch (err) {
-                    this.logger.warn(
-                        `[${proto}] history fetch failed: ${err.message}. Using 0% APY.`,
-                    );
-                    protocolHistoryCache[proto] = [];
-                }
-            }),
-        );
+        const invalidAllocations = [];
+        for (const alloc of allocations) {
+            const entry = tokenMap.get(alloc.assetSymbol);
+            if (!entry) {
+                invalidAllocations.push({
+                    protocol: alloc.protocol,
+                    assetSymbol: alloc.assetSymbol,
+                    reason: `Token '${alloc.assetSymbol}' does not exist in any pool.`,
+                    availableOn: [],
+                });
+            } else if (!entry.protocols.some(p => p.toLowerCase() === alloc.protocol.toLowerCase())) {
+                invalidAllocations.push({
+                    protocol: alloc.protocol,
+                    assetSymbol: alloc.assetSymbol,
+                    reason: `Token '${alloc.assetSymbol}' is not available on protocol '${alloc.protocol}'.`,
+                    availableOn: entry.protocols.map(p => ({
+                        protocol: p,
+                        poolTypes: entry.poolTypes,
+                    })),
+                });
+            }
+        }
+        if (invalidAllocations.length > 0) {
+            throw new HttpException(
+                {
+                    statusCode: 422,
+                    error: 'InvalidAllocations',
+                    message: `${invalidAllocations.length} allocation(s) have invalid protocol/token combinations.`,
+                    invalidAllocations,
+                },
+                422,
+            );
+        }
+
+        // ── Step B: Fetch ALL history once (API per-field filters are broken) ─────────
+        let allRecords: PoolHistoryRecord[] = [];
+        try {
+            const histResp = await this.poolsClient.fetchPoolHistory({});
+            allRecords = histResp.data ?? [];
+            this.logger.debug(`Loaded ${allRecords.length} total history records`);
+        } catch (err) {
+            this.logger.warn(`History fetch failed: ${err.message}. All APYs will be 0.`);
+        }
+
+        const byExact = new Map<string, PoolHistoryRecord[]>();
+        const byAsset = new Map<string, PoolHistoryRecord[]>();
+        for (const rec of allRecords) {
+            const key = `${rec.protocol}/${rec.assetSymbol}`;
+            if (!byExact.has(key)) byExact.set(key, []);
+            byExact.get(key)!.push(rec);
+            if (!byAsset.has(rec.assetSymbol)) byAsset.set(rec.assetSymbol, []);
+            byAsset.get(rec.assetSymbol)!.push(rec);
+        }
 
         const allocStates: AllocState[] = allocations.map((alloc) => {
-            const rawRecords = (protocolHistoryCache[alloc.protocol] ?? []).filter(
-                (r) => r.assetSymbol.toLowerCase() === alloc.assetSymbol.toLowerCase(),
-            );
+            const exactKey = `${alloc.protocol}/${alloc.assetSymbol}`;
+            let rawRecords = byExact.get(exactKey) ?? [];
+            let dataSource = exactKey;
+
+            if (rawRecords.length === 0) {
+                const fallback = byAsset.get(alloc.assetSymbol) ?? [];
+                if (fallback.length > 0) {
+                    rawRecords = fallback;
+                    dataSource = `${fallback[0].protocol}/${alloc.assetSymbol}`;
+                    this.logger.debug(`[${exactKey}] no history → using ${dataSource} as fallback`);
+                }
+            }
+
             const apyHistory = this.buildApyMap(rawRecords);
             this.logger.debug(
-                `[${alloc.protocol}/${alloc.assetSymbol}] matched ${rawRecords.length} records, ${Object.keys(apyHistory).length} unique days`,
+                `[${exactKey}] ${rawRecords.length} records → ${Object.keys(apyHistory).length} unique days`,
             );
             return {
                 protocol: alloc.protocol,
@@ -142,6 +188,7 @@ export class BacktestService {
                 firstPrice: undefined,
                 apySamples: [],
                 ilLossUsd: 0,
+                dataSource,
             };
         });
 
@@ -158,7 +205,7 @@ export class BacktestService {
 
             // ── Apply daily APY growth ──
             for (const state of allocStates) {
-                const apy = this.getApyForDay(state.apyHistory, dateStr, days);
+                const apy = this.getApyForDay(state.apyHistory, dateStr);
                 state.apySamples.push(apy);
 
                 if (i > 0) {
@@ -257,9 +304,11 @@ export class BacktestService {
             const minApy = state.apySamples.length > 0 ? Math.min(...state.apySamples) : 0;
             const maxApy = state.apySamples.length > 0 ? Math.max(...state.apySamples) : 0;
 
+            const hasHistoricalData = Object.keys(state.apyHistory).length > 0;
             return {
                 protocol: state.protocol,
                 assetSymbol: state.assetSymbol,
+                dataSource: state.dataSource,
                 poolType: state.poolType,
                 allocationPercent: state.percentage,
                 allocatedUsd: parseFloat(allocatedUsd.toFixed(4)),
@@ -271,7 +320,10 @@ export class BacktestService {
                 returnUsd: parseFloat(returnUsd.toFixed(4)),
                 returnPercent: parseFloat(returnPct.toFixed(4)),
                 dataPointsUsed: state.apySamples.length,
-                hasHistoricalData: Object.keys(state.apyHistory).length > 0,
+                hasHistoricalData,
+                ...(!hasHistoricalData && {
+                    warning: `No historical APY data found for ${state.protocol}/${state.assetSymbol}. All returns computed as 0%.`,
+                }),
             };
         });
 
@@ -307,10 +359,8 @@ export class BacktestService {
         const map: DailyApyMap = {};
         for (const rec of records) {
             const dateKey = rec.dataTimestamp.slice(0, 10); // "YYYY-MM-DD"
-            const apy =
-                rec.totalApy !== undefined
-                    ? rec.totalApy
-                    : (rec.supplyApy ?? 0) + (rec.rewardApy ?? 0);
+            // Use ?? so that totalApy=0 is treated as "no data" and falls back to supplyApy+rewardApy
+            const apy = rec.totalApy ?? ((rec.supplyApy ?? 0) + (rec.rewardApy ?? 0));
             // If multiple records for same day, keep the most recent (last wins)
             map[dateKey] = apy;
         }
@@ -321,11 +371,7 @@ export class BacktestService {
      * Get APY for a given date.
      * Strategy: exact match → nearest past date → nearest future date → 0
      */
-    private getApyForDay(
-        map: DailyApyMap,
-        dateStr: string,
-        allDays: string[],
-    ): number {
+    private getApyForDay(map: DailyApyMap, dateStr: string): number {
         if (map[dateStr] !== undefined) return map[dateStr];
 
         const mapKeys = Object.keys(map).sort();

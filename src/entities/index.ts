@@ -107,3 +107,26 @@ export class ActivityLog {
     @Index()
     createdAt: Date;
 }
+
+// ─── 8. Strategy Cache ───
+@Entity('strategy_cache')
+export class StrategyCache {
+    @ObjectIdColumn()
+    id: ObjectId;
+
+    @Column()
+    @Index({ unique: true })
+    cacheKey: string; // always 'strategies'
+
+    @Column()
+    data: Record<string, any>; // SuggestStrategiesResult as BSON subdocument
+
+    @Column()
+    expiresAt: Date;
+
+    @Column()
+    generatedAt: Date;
+
+    @UpdateDateColumn()
+    updatedAt: Date;
+}

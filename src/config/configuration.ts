@@ -19,7 +19,7 @@ export default () => ({
         limit: parseInt(process.env.THROTTLE_LIMIT, 10) || 100,
     },
 
-    poolsApiUrl: process.env.POOLS_API_URL || 'http://localhost:3000',
+    poolsApiUrl: process.env.POOLS_API_URL,
 
     openaiApiKey: process.env.OPENAI_API_KEY || '',
 });

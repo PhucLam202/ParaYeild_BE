@@ -1,7 +1,9 @@
 import {
     Controller,
     Post,
+    Get,
     Body,
+    Query,
     HttpCode,
     HttpStatus,
     UseGuards,
@@ -10,10 +12,18 @@ import {
     ApiTags,
     ApiOperation,
     ApiSecurity,
+    ApiQuery,
 } from '@nestjs/swagger';
 import { PriceIndexerService } from './price-indexer.service';
 import { ApiKeyGuard } from '../../common/guards/api-key.guard';
-import { IsString, IsDateString } from 'class-validator';
+import { IsString, IsDateString, IsOptional } from 'class-validator';
+import { Public } from '../../common/decorators/public.decorator';
+
+export class RealtimePriceQueryDto {
+    @IsOptional()
+    @IsString()
+    symbols?: string = 'DOT';
+}
 
 export class FetchHistoricalPricesDto {
     @IsString()
@@ -32,6 +42,24 @@ export class FetchHistoricalPricesDto {
 @ApiSecurity('X-API-Key')
 export class PriceIndexerController {
     constructor(private readonly priceService: PriceIndexerService) { }
+
+    @Public()
+    @Get('tokens/realtime')
+    @ApiOperation({ summary: 'Get real-time prices for one or more tokens from Binance via ccxt' })
+    @ApiQuery({
+        name: 'symbols',
+        required: false,
+        example: 'DOT,ETH,KSM,ASTR,GLMR',
+        description: 'Comma-separated token symbols (e.g. DOT,ETH,KSM)',
+    })
+    async getTokensRealtimePrice(@Query() query: RealtimePriceQueryDto) {
+        const tokens = (query.symbols ?? 'DOT')
+            .split(',')
+            .map((s) => s.trim().toUpperCase())
+            .filter(Boolean);
+        const data = await this.priceService.getTokensRealtimePrice(tokens);
+        return { tokens: data };
+    }
 
     @Post('fetch-historical')
     @HttpCode(HttpStatus.OK)

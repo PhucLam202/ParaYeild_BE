@@ -1,7 +1,8 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, HttpException, HttpStatus } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { MongoRepository } from 'typeorm';
 import axios from 'axios';
+import * as ccxt from 'ccxt';
 import { TokenPrice } from '../../entities';
 import { PRICE_CONFIG } from '../../config/bifrost.config';
 
@@ -61,6 +62,35 @@ export class PriceIndexerService {
             order: { timestamp: 'DESC' },
         });
         return lastPrice?.priceUsd ?? 0;
+    }
+
+    // ─── Lấy giá realtime nhiều token từ Binance qua ccxt ───
+    async getTokensRealtimePrice(tokens: string[]): Promise<Array<{
+        symbol: string;
+        price: number | null;
+        timestamp: string | null;
+        error?: string;
+    }>> {
+        const exchange = new ccxt.binance();
+        const results = await Promise.all(
+            tokens.map(async (token) => {
+                const symbol = `${token.toUpperCase()}/USDT`;
+                try {
+                    const ticker = await exchange.fetchTicker(symbol);
+                    return {
+                        symbol,
+                        price: ticker.last ?? null,
+                        timestamp: ticker.timestamp
+                            ? new Date(ticker.timestamp).toISOString()
+                            : new Date().toISOString(),
+                    };
+                } catch (e) {
+                    this.logger.warn(`ccxt fetchTicker failed for ${symbol}: ${e.message}`);
+                    return { symbol, price: null, timestamp: null, error: e.message };
+                }
+            }),
+        );
+        return results;
     }
 
     // ─── Bulk backfill historical prices từ DeFiLlama ───

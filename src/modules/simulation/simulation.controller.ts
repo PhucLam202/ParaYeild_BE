@@ -99,6 +99,29 @@ class ProtocolsResponseDto {
 export class PoolsController {
     constructor(private readonly simulationService: SimulationService) { }
 
+    @Get('lp-farms')
+    @Public()
+    @ApiOperation({
+        summary: 'Lấy tất cả LP Farming pools (blp_farm + lp_farm)',
+        description:
+            'Trả về tất cả LP farming pools từ Bifrost và các protocol khác. ' +
+            'Kết hợp blp_farm + lp_farm trong một lần gọi, sort theo APY giảm dần.',
+    })
+    @ApiQuery({ name: 'protocol', required: false, example: 'bifrost' })
+    @ApiQuery({ name: 'network', required: false, example: 'bifrost' })
+    @ApiQuery({ name: 'asset', required: false, example: 'DOT-vDOT' })
+    @ApiQuery({ name: 'minApy', required: false, example: 5 })
+    @ApiQuery({ name: 'limit', required: false, example: 50 })
+    async getLpFarmingPools(
+        @Query('protocol') protocol?: string,
+        @Query('network') network?: string,
+        @Query('asset') asset?: string,
+        @Query('minApy') minApy?: number,
+        @Query('limit') limit?: number,
+    ) {
+        return this.simulationService.getLpFarmingPools({ protocol, network, asset, minApy, limit });
+    }
+
     @Get()
     @Public()
     @ApiOperation({
@@ -111,7 +134,7 @@ export class PoolsController {
     @ApiQuery({ name: 'network', required: false, example: 'polkadot', description: 'polkadot | moonbeam | bifrost | hydration' })
     @ApiQuery({ name: 'minApy', required: false, example: 5, description: 'APY tối thiểu (%)' })
     @ApiQuery({ name: 'limit', required: false, example: 50, description: 'Số bản ghi (max 200)' })
-    @ApiQuery({ name: 'sortBy', required: false, example: 'totalApy', description: 'totalApy | tvlUsd | crawledAt' })
+    @ApiQuery({ name: 'sortBy', required: false, example: 'totalApy', description: 'apy | totalApy | supplyApy | rewardApy | tvlUsd | crawledAt' })
     @ApiQuery({ name: 'from', required: false, example: '2026-01-01', description: 'Từ ngày (ISO)' })
     @ApiQuery({ name: 'to', required: false, example: '2026-02-01', description: 'Đến ngày (ISO)' })
     async getPools(
@@ -164,11 +187,16 @@ export class SimulationController {
     @Public()
     @ApiOperation({
         summary: 'Lấy danh sách All Tokens',
-        description: 'Trả về all token cho Token Pair (đơn hoặc cặp).',
+        description: 'Trả về all token cho Token Pair (đơn hoặc cặp). Có thể lọc theo protocol / network.',
     })
+    @ApiQuery({ name: 'protocol', required: false, description: 'Lọc token theo protocol' })
+    @ApiQuery({ name: 'network', required: false, description: 'Lọc token theo network' })
     @ApiOkResponse({ type: TokensResponseDto })
-    async getTokens() {
-        const data = await this.simulationService.getTokens();
+    async getTokens(
+        @Query('protocol') protocol?: string,
+        @Query('network') network?: string,
+    ) {
+        const data = await this.simulationService.getTokens(protocol, network);
         return { data };
     }
 

@@ -73,7 +73,11 @@ export class PoolsClientService {
         const limitNum = Number(params.limit);
         if (!isNaN(limitNum) && params.limit !== undefined && params.limit !== null)
             query.set('limit', String(limitNum));
-        if (params.sortBy) query.set('sortBy', params.sortBy);
+        if (params.sortBy) {
+            let sortProp = params.sortBy;
+            if (sortProp === 'apy') sortProp = 'totalApy';
+            query.set('sortBy', sortProp);
+        }
         if (params.from) query.set('from', params.from);
         if (params.to) query.set('to', params.to);
 
@@ -137,8 +141,12 @@ export class PoolsClientService {
     }
 
     // ─── GET /pools/tokens ───
-    async fetchTokens(): Promise<any> {
-        const url = `${this.baseUrl}/pools/tokens`;
+    async fetchTokens(protocol?: string, network?: string): Promise<any> {
+        const query = new URLSearchParams();
+        if (protocol) query.set('protocol', protocol);
+        if (network) query.set('network', network);
+        const qStr = query.toString();
+        const url = `${this.baseUrl}/pools/tokens${qStr ? `?${qStr}` : ''}`;
         try {
             const resp = await axios.get(url, { timeout: 10000 });
             return resp.data;

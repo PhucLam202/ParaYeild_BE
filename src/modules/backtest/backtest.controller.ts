@@ -13,6 +13,7 @@ import {
     ApiQuery,
     ApiBody,
     ApiProperty,
+    ApiExtraModels,
 } from '@nestjs/swagger';
 import {
     IsNumber,
@@ -28,39 +29,41 @@ import {
     ArrayMinSize,
 } from 'class-validator';
 import { Type } from 'class-transformer';
-import { BacktestService } from './backtest.service';
+import { BacktestService, PoolType } from './backtest.service';
 import { StrategyService } from './strategy.service';
 import { Public } from '../../common/decorators/public.decorator';
 
 // ─── DTO classes for Swagger + validation ────────────────────────────────────
 
 class BacktestAllocationDto {
-    @ApiProperty({ example: 'bifrost', description: 'Protocol name' })
+    @ApiProperty({ example: 'hydration', description: 'Protocol name' })
     @IsString()
     protocol: string;
 
-    @ApiProperty({ example: 'vDOT', description: 'Asset symbol' })
+    @ApiProperty({ example: 'DOT-ETH', description: 'Asset symbol (LP pair or single asset)' })
     @IsString()
     assetSymbol: string;
 
-    @ApiProperty({ example: 60, description: 'Allocation % (must sum to 100 across all)' })
+    @ApiProperty({ example: 100, description: 'Allocation % (must sum to 100 across all)' })
     @IsNumber()
     @Min(0.01)
     @Max(100)
     percentage: number;
 
     @ApiProperty({
-        example: 'vstaking',
+        enum: PoolType,
+        enumName: 'PoolType',
+        example: PoolType.VSTAKING,
         required: false,
-        description: 'Pool type — "dex" enables IL calculation',
+        description: '"farming"/"dex" enables split-APY + IL; "vstaking"/"lending" uses combined APY',
     })
     @IsOptional()
-    @IsString()
-    poolType?: string;
+    @IsEnum(PoolType)
+    poolType?: PoolType;
 }
 
 class RunBacktestDto {
-    @ApiProperty({ example: 10000, description: 'Initial capital in USD' })
+    @ApiProperty({ example: 1000, description: 'Initial capital in USD' })
     @IsNumber()
     @Min(1)
     initialAmountUsd: number;
@@ -69,16 +72,21 @@ class RunBacktestDto {
     @IsDateString()
     from: string;
 
-    @ApiProperty({ example: '2026-02-01', description: 'End date (YYYY-MM-DD)' })
+    @ApiProperty({ example: '2026-04-01', description: 'End date (YYYY-MM-DD)' })
     @IsDateString()
     to: string;
 
     @ApiProperty({
         type: [BacktestAllocationDto],
-        description: 'Capital allocations — percentage must sum to 100',
+        description:
+            'Capital allocations — percentage must sum to 100.\n\n' +
+            '**Pool type effects:**\n' +
+            '- `farming` / `dex`: Enables split APY model. `supplyApy` (trading fees) ' +
+            'auto-compounds daily into LP value. `rewardApy` (farm emissions) accrues ' +
+            'into a pending harvest bucket and is only reinvested every `compoundFrequencyDays`.\n' +
+            '- `vstaking` / `lending`: Combined APY compounds daily (classic model).',
         example: [
-            { protocol: 'bifrost', assetSymbol: 'vDOT', percentage: 60, poolType: 'vstaking' },
-            { protocol: 'hydration', assetSymbol: 'HOLLAR', percentage: 40, poolType: 'dex' },
+            { protocol: 'hydration', assetSymbol: 'DOT-ETH', percentage: 100, poolType: 'farming' },
         ],
     })
     @IsArray()
@@ -88,7 +96,7 @@ class RunBacktestDto {
     allocations: BacktestAllocationDto[];
 
     @ApiProperty({
-        example: 7,
+        example: 0,
         required: false,
         description: 'Rebalance every N days. 0 = never rebalance.',
     })
@@ -98,9 +106,45 @@ class RunBacktestDto {
     rebalanceIntervalDays?: number;
 
     @ApiProperty({
+        example: true,
+        required: false,
+        description:
+            'If true, harvested farming rewards are reinvested back into the LP pool.\n' +
+            'If false, farming rewards accumulate without compounding.',
+    })
+    @IsOptional()
+    @IsBoolean()
+    isCompound?: boolean;
+
+    @ApiProperty({
+        example: 7,
+        required: false,
+        description:
+            '**[Yield Farming]** Harvest and reinvest farming rewards every N days. ' +
+            'Defaults to 7 (weekly). Ignored if `isCompound=false` or `poolType` is not `farming`/`dex`.',
+    })
+    @IsOptional()
+    @IsNumber()
+    @Min(1)
+    compoundFrequencyDays?: number;
+
+    @ApiProperty({
+        example: 0.5,
+        required: false,
+        description:
+            '**[Yield Farming]** Gas/transaction fee (in USD) deducted per harvest event. ' +
+            'Simulates the real cost of calling the harvest/claim function. Defaults to $0.50.',
+    })
+    @IsOptional()
+    @IsNumber()
+    @Min(0)
+    compoundFeeUsd?: number;
+
+    @ApiProperty({
         example: false,
         required: false,
-        description: 'Apply Impermanent Loss estimate for DEX/farming pools.',
+        description:
+            'Apply Impermanent Loss estimation for DEX/farming pools at end of period.',
     })
     @IsOptional()
     @IsBoolean()
@@ -117,18 +161,11 @@ class RunBacktestDto {
     xcmFeeUsd?: number;
 
     @ApiProperty({
-        example: true,
-        required: false,
-        description: 'Auto-compound/Reinvest rewards into the principal.',
-    })
-    @IsOptional()
-    @IsBoolean()
-    isCompound?: boolean;
-
-    @ApiProperty({
         example: 0.5,
         required: false,
-        description: 'Slippage tolerance % applied on initial deployment and rebalancing.',
+        description:
+            'Slippage tolerance % applied on initial deployment, rebalancing, and when ' +
+            'swapping reward tokens back to LP during harvest.',
     })
     @IsOptional()
     @IsNumber()
@@ -182,8 +219,22 @@ export class BacktestController {
     ) { }
 
     /**
+     * GET /api/v1/backtest/metadata
+     */
+    @Get('metadata')
+    @Public()
+    @ApiOperation({
+        summary: 'Lấy metadata cấu hình cho Backtest (Protocols, Tokens, PoolTypes)',
+        description:
+            'Trả về danh sách các protocol và các token tương ứng kèm theo poolType hợp lệ. ' +
+            'Frontend nên dùng dữ liệu này để ràng buộc (constrain) dropdown, tránh lỗi 422.',
+    })
+    async getMetadata() {
+        return this.backtestService.getBacktestMetadata();
+    }
+
+    /**
      * GET /api/v1/backtest/suggest-strategies
-     * Use LLM to analyse current pools and generate investment chain suggestions.
      */
     @Get('suggest-strategies')
     @Public()
@@ -198,7 +249,7 @@ Mỗi chain bao gồm:
 - Mức rủi ro (low / medium / high)
 - Lý giải từ AI
 
-**Cache:** Kết quả được cache 5 phút để tiết kiệm token. Dùng \`?refresh=true\` để force regenerate.
+**Cache:** Kết quả được cache 5 phút. Dùng \`?refresh=true\` để force regenerate.
         `,
     })
     @ApiQuery({ name: 'riskLevel', required: false, enum: ['low', 'medium', 'high'] })
@@ -218,8 +269,6 @@ Mỗi chain bao gồm:
 
     /**
      * GET /api/v1/backtest/apy-history
-     * Proxy to external /pools/history endpoint — use to inspect raw APY data
-     * before running a full backtest.
      */
     @Get('apy-history')
     @Public()
@@ -227,13 +276,14 @@ Mỗi chain bao gồm:
         summary: 'Lấy lịch sử APY của pool từ external server',
         description:
             'Proxy đến `/pools/history` của external data server. ' +
-            'Dùng để kiểm tra dữ liệu historical APY trước khi chạy backtest.',
+            'Dữ liệu trả về gồm `supplyApy` (trading fees) và `rewardApy` (farm rewards) ' +
+            'để kiểm tra trước khi chạy backtest.',
     })
-    @ApiQuery({ name: 'protocol', required: false, example: 'bifrost' })
-    @ApiQuery({ name: 'asset', required: false, example: 'vDOT' })
-    @ApiQuery({ name: 'poolType', required: false, example: 'vstaking' })
+    @ApiQuery({ name: 'protocol', required: false, example: 'hydration' })
+    @ApiQuery({ name: 'asset', required: false, example: 'DOT-ETH' })
+    @ApiQuery({ name: 'poolType', required: false, example: 'farming' })
     @ApiQuery({ name: 'from', required: false, example: '2026-01-01' })
-    @ApiQuery({ name: 'to', required: false, example: '2026-02-01' })
+    @ApiQuery({ name: 'to', required: false, example: '2026-04-01' })
     async getApyHistory(
         @Query('protocol') protocol?: string,
         @Query('asset') asset?: string,
@@ -241,36 +291,52 @@ Mỗi chain bao gồm:
         @Query('from') from?: string,
         @Query('to') to?: string,
     ) {
-        return this.backtestService.fetchApyHistory({
-            protocol,
-            asset,
-            poolType,
-            from,
-            to,
-        });
+        return this.backtestService.fetchApyHistory({ protocol, asset, poolType, from, to });
     }
 
     /**
      * POST /api/v1/backtest/run
-     * Run a full historical backtest using real day-by-day APY data.
      */
     @Post('run')
     @Public()
     @HttpCode(HttpStatus.OK)
     @ApiOperation({
-        summary: 'Chạy backtest với APY lịch sử thực tế',
+        summary: '🚀 Chạy backtest với APY lịch sử thực tế (Hỗ trợ Yield Farming)',
         description: `
-**Backtest engine thế hệ 2** — sử dụng APY thực tế từng ngày thay vì APY tĩnh.
+**Backtest Engine v3** — Hỗ trợ 2 chế độ tính toán dựa trên \`poolType\`:
 
-**Logic:**
-- Với mỗi allocation, fetch lịch sử APY từ \`/pools/history\`
-- Loop từng ngày: compound daily \`value *= (1 + APY%/365/100)\`
-- Nếu là rebalance day: phân bổ lại theo % ban đầu, trừ XCM fee
-- Nếu pool DEX/farming: tính Impermanent Loss ước tính
-- Output: Sharpe Ratio, Max Drawdown, full timeSeries
+---
 
-**APY fallback:** Nếu ngày không có data → dùng APY của ngày gần nhất.
-    `,
+### 🌾 Yield Farming Mode (\`poolType: "farming"\` hoặc \`"dex"\`)
+
+Tách APY thành 2 thành phần với cách xử lý khác nhau:
+
+| Thành phần | Nguồn | Cách tính |
+|---|---|---|
+| **Trading Fees** (\`supplyApy\`) | Phí giao dịch DEX | Auto-compound HÀNG NGÀY vào giá trị LP (không cần gas) |
+| **Farm Rewards** (\`rewardApy\`) | Farm token emissions | Tích lũy vào bucket riêng, chỉ reinvest mỗi \`compoundFrequencyDays\` ngày |
+
+**Harvest Simulation:**
+\`\`\`
+Mỗi compoundFrequencyDays ngày:
+  rewards_after_gas = unclaimed_rewards - compoundFeeUsd
+  rewards_reinvested = rewards_after_gas * (1 - slippagePct/100)
+  LP_value += rewards_reinvested
+\`\`\`
+
+---
+
+### 📊 Single Pool Mode (\`poolType: "vstaking"\` hoặc \`"lending"\`)
+
+APY tổng = \`supplyApy + rewardApy\`, compound hàng ngày (hành vi giống v2).
+
+---
+
+### 📉 Impermanent Loss (\`includeIL: true\`)
+
+Áp dụng cho DEX/Farming pools vào cuối kỳ.  
+Công thức: \`IL = 2√r / (1 + r) - 1\` (Uniswap v2 AMM formula, r = price ratio).
+        `,
     })
     @ApiBody({ type: RunBacktestDto })
     async runBacktest(@Body() dto: RunBacktestDto) {

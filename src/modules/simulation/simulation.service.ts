@@ -75,9 +75,40 @@ export class SimulationService {
         return response?.data || [];
     }
 
-    async getTokens() {
-        const response = await this.poolsClient.fetchTokens();
-        return response?.data || [];
+    async getTokens(protocol?: string, network?: string) {
+        const response = await this.poolsClient.fetchTokens(protocol, network);
+        let tokens = response?.data || [];
+
+        if (protocol) {
+            const protoLower = protocol.toLowerCase();
+            tokens = tokens.filter((t: any) => t.protocols?.some((p: string) => p.toLowerCase() === protoLower));
+        }
+        if (network) {
+            const netLower = network.toLowerCase();
+            tokens = tokens.filter((t: any) => t.networks?.some((n: string) => n.toLowerCase() === netLower));
+        }
+
+        return tokens;
+    }
+
+    async getLpFarmingPools(params: Omit<PoolsQueryParams, 'poolType'>) {
+        const [blpResult, lpResult] = await Promise.all([
+            this.poolsClient.fetchPools({ ...params, poolType: 'blp_farm' }),
+            this.poolsClient.fetchPools({ ...params, poolType: 'lp_farm' }),
+        ]);
+
+        const combined = [
+            ...(blpResult.data || []),
+            ...(lpResult.data || []),
+        ].filter(p => hasCoreToken(p.assetSymbol));
+
+        combined.sort((a, b) => {
+            const apyA = (a as any).totalApy ?? (a as any).supplyApy ?? (a as any).rewardApy ?? 0;
+            const apyB = (b as any).totalApy ?? (b as any).supplyApy ?? (b as any).rewardApy ?? 0;
+            return apyB - apyA;
+        });
+
+        return { count: combined.length, data: combined };
     }
 
     async getProtocols() {

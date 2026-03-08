@@ -71,7 +71,7 @@ export class PriceIndexerService {
         timestamp: string | null;
         error?: string;
     }>> {
-        const exchange = new ccxt.binance();
+        const exchange = new ccxt.okx();
         const results = await Promise.all(
             tokens.map(async (token) => {
                 const symbol = `${token.toUpperCase()}/USDT`;

@@ -3,7 +3,7 @@ import { NestFactory, Reflector } from '@nestjs/core';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { ValidationPipe, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import * as helmet from 'helmet';
+import helmet from 'helmet';
 import { AppModule } from './app.module';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
 import { LoggingInterceptor } from './common/interceptors/logging.interceptor';
@@ -20,7 +20,7 @@ async function bootstrap() {
     const allowedOrigins = configService.get<string[]>('security.allowedOrigins');
 
     // ─── Security: Helmet HTTP headers ───
-    app.use(helmet.default({
+    app.use(helmet({
         contentSecurityPolicy: nodeEnv === 'production',
         crossOriginEmbedderPolicy: nodeEnv === 'production',
     }));
@@ -29,7 +29,14 @@ async function bootstrap() {
     app.enableCors({
         origin: allowedOrigins,
         methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-        allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
+        allowedHeaders: [
+            'Content-Type',
+            'Accept',
+            'Authorization',
+            'X-API-Key',
+            'X-Requested-With',
+            'Origin',
+        ],
         credentials: true,
     });
 

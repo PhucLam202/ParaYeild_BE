@@ -9,7 +9,9 @@ export default () => ({
     security: {
         adminApiKey: process.env.ADMIN_API_KEY || 'change-me-in-production',
         allowedOrigins: process.env.ALLOWED_ORIGINS
-            ? process.env.ALLOWED_ORIGINS.split(',').map((o) => o.trim())
+            ? process.env.ALLOWED_ORIGINS.split(',')
+                .map((o) => o.trim())
+                .filter((o) => o.length > 0)
             : ['http://localhost:3001'],
         jwtSecret: process.env.JWT_SECRET || 'change-me-jwt-secret',
     },

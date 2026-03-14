@@ -134,7 +134,7 @@ export class PoolsController {
     @ApiQuery({ name: 'network', required: false, example: 'polkadot', description: 'polkadot | moonbeam | bifrost | hydration' })
     @ApiQuery({ name: 'minApy', required: false, example: 5, description: 'APY tối thiểu (%)' })
     @ApiQuery({ name: 'limit', required: false, example: 50, description: 'Số bản ghi (max 200)' })
-    @ApiQuery({ name: 'sortBy', required: false, example: 'totalApy', description: 'apy | totalApy | supplyApy | rewardApy | tvlUsd | crawledAt' })
+    @ApiQuery({ name: 'sortBy', required: false, example: 'totalApy', description: 'apy | totalApy | supplyApy | rewardApy | tvlUsd | crawledAt | apy30dAvg | riskScore' })
     @ApiQuery({ name: 'from', required: false, example: '2026-01-01', description: 'Từ ngày (ISO)' })
     @ApiQuery({ name: 'to', required: false, example: '2026-02-01', description: 'Đến ngày (ISO)' })
     async getPools(

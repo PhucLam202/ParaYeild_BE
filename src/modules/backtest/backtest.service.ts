@@ -8,15 +8,159 @@ import { PoolsClientService, PoolHistoryRecord, PoolSnapshot, PoolsQueryParams }
 
 // ─── DTOs ───────────────────────────────────────────────────────────────────
 
+/**
+ * Pool type — determines how APY is calculated in the backtest engine.
+ *
+ *  farming / dex / blp_farm / lp_farm  → split-APY model (supplyApy + rewardApy)
+ *                                         with harvest simulation & IL risk
+ *  vstaking / lending                   → combined APY, daily compound, no IL
+ */
 export enum PoolType {
+    /** Yield farming pool — LP tokens staked in a farm contract for reward emissions */
     FARMING = 'farming',
+    /** DEX liquidity pool — earn trading fees from swaps, subject to Impermanent Loss */
     DEX = 'dex',
+    /** Liquid staking (vToken) — e.g. DOT→vDOT on Bifrost, auto-compound staking yield */
     VSTAKING = 'vstaking',
+    /** Lending/borrowing market — supply assets to earn interest (Moonwell, Starlay…) */
     LENDING = 'lending',
-    UNKNOWN = 'unknown',
+    /** Bifrost LP farm — Bifrost-native LP farming with BNC rewards */
     BLP_FARM = 'blp_farm',
+    /** Generic LP farm — LP tokens staked in third-party farm (Hydration, StellaSwap…) */
     LP_FARM = 'lp_farm',
+    /** Fallback when pool type cannot be determined from data source */
+    UNKNOWN = 'unknown',
 }
+
+/**
+ * Strategy type — high-level investment strategy category for FE dropdown.
+ * Each strategy implies a different risk/reward profile and user intent.
+ */
+export enum StrategyType {
+    /** Stake LP tokens in farms to earn emission rewards (BNC, GLMR…) — medium-high risk, high APY */
+    YIELD_FARMING = 'yield_farming',
+    /** Mint liquid staking derivatives (vDOT, stKSM…) — low risk, stable yield */
+    LIQUID_STAKING = 'liquid_staking',
+    /** Supply assets to lending markets for interest — low-medium risk, moderate yield */
+    LENDING = 'lending',
+    /** Provide liquidity to DEX pairs — medium risk, earns trading fees + IL exposure */
+    DEX_LP = 'dex_lp',
+    /** Split capital across multiple parachains via XCM — diversified, includes bridge fees */
+    MULTI_CHAIN = 'multi_chain',
+}
+
+/**
+ * Maps each PoolType to its corresponding StrategyType.
+ * FE uses this to auto-select strategy dropdown when user picks a pool.
+ */
+export const POOL_TO_STRATEGY_MAP: Record<PoolType, StrategyType> = {
+    [PoolType.FARMING]: StrategyType.YIELD_FARMING,
+    [PoolType.BLP_FARM]: StrategyType.YIELD_FARMING,
+    [PoolType.LP_FARM]: StrategyType.YIELD_FARMING,
+    [PoolType.DEX]: StrategyType.DEX_LP,
+    [PoolType.VSTAKING]: StrategyType.LIQUID_STAKING,
+    [PoolType.LENDING]: StrategyType.LENDING,
+    [PoolType.UNKNOWN]: StrategyType.YIELD_FARMING,
+};
+
+/**
+ * Detailed enum definitions for FE to render labels, descriptions, icons.
+ * Returned by GET /backtest/metadata → enums.poolTypeDetails / strategyTypeDetails
+ */
+export const POOL_TYPE_DETAILS: Array<{
+    value: PoolType; label: string; description: string; hasIL: boolean; apyModel: string;
+}> = [
+    {
+        value: PoolType.FARMING,
+        label: 'Yield Farming',
+        description: 'Stake LP tokens in farm contracts to earn reward token emissions (e.g. BNC, GLMR). Rewards need periodic harvesting.',
+        hasIL: true,
+        apyModel: 'split (supplyApy + rewardApy)',
+    },
+    {
+        value: PoolType.DEX,
+        label: 'DEX Liquidity',
+        description: 'Provide liquidity to a DEX pair and earn trading fees from every swap. Subject to Impermanent Loss.',
+        hasIL: true,
+        apyModel: 'split (supplyApy + rewardApy)',
+    },
+    {
+        value: PoolType.BLP_FARM,
+        label: 'Bifrost LP Farm',
+        description: 'Bifrost-native LP farming. Stake BLP tokens to earn BNC rewards on top of trading fees.',
+        hasIL: true,
+        apyModel: 'split (supplyApy + rewardApy)',
+    },
+    {
+        value: PoolType.LP_FARM,
+        label: 'LP Farm',
+        description: 'Third-party LP farming on Hydration, StellaSwap, etc. LP tokens staked for dual yield.',
+        hasIL: true,
+        apyModel: 'split (supplyApy + rewardApy)',
+    },
+    {
+        value: PoolType.VSTAKING,
+        label: 'Liquid Staking',
+        description: 'Mint liquid staking derivatives (vDOT, vKSM, vGLMR) on Bifrost. Auto-compounding staking yield, no IL.',
+        hasIL: false,
+        apyModel: 'combined (totalApy compounds daily)',
+    },
+    {
+        value: PoolType.LENDING,
+        label: 'Lending',
+        description: 'Supply assets to lending protocols (Moonwell, Starlay) to earn interest. No IL, variable rate.',
+        hasIL: false,
+        apyModel: 'combined (totalApy compounds daily)',
+    },
+    {
+        value: PoolType.UNKNOWN,
+        label: 'Unknown',
+        description: 'Pool type not determined. Defaults to combined APY model.',
+        hasIL: false,
+        apyModel: 'combined',
+    },
+];
+
+export const STRATEGY_TYPE_DETAILS: Array<{
+    value: StrategyType; label: string; description: string;
+    riskLevel: string; expectedApyRange: string;
+}> = [
+    {
+        value: StrategyType.YIELD_FARMING,
+        label: 'Yield Farming',
+        description: 'Stake LP tokens in farm contracts for emission rewards. Highest APY but requires harvest management and carries IL risk.',
+        riskLevel: 'medium-high',
+        expectedApyRange: '10-50%',
+    },
+    {
+        value: StrategyType.LIQUID_STAKING,
+        label: 'Liquid Staking',
+        description: 'Convert DOT/KSM to liquid derivatives (vDOT, stKSM). Earn staking yield while keeping liquidity. Lowest risk.',
+        riskLevel: 'low',
+        expectedApyRange: '5-15%',
+    },
+    {
+        value: StrategyType.LENDING,
+        label: 'Lending',
+        description: 'Supply assets to lending markets for interest income. Variable rates, no IL. Good for stablecoin strategies.',
+        riskLevel: 'low-medium',
+        expectedApyRange: '3-12%',
+    },
+    {
+        value: StrategyType.DEX_LP,
+        label: 'DEX Liquidity Provision',
+        description: 'Provide liquidity to DEX pairs and earn trading fees. Subject to Impermanent Loss depending on price divergence.',
+        riskLevel: 'medium',
+        expectedApyRange: '8-30%',
+    },
+    {
+        value: StrategyType.MULTI_CHAIN,
+        label: 'Multi-Chain Strategy',
+        description: 'Diversify capital across multiple parachains via XCM. Combines different pool types for risk-adjusted returns. Includes XCM bridge fees.',
+        riskLevel: 'varies',
+        expectedApyRange: '8-25%',
+    },
+];
 
 export interface BacktestAllocation {
     protocol: string;
@@ -111,6 +255,7 @@ export class BacktestService {
         protocol?: string;
         asset?: string;
         poolType?: string;
+        network?: string;
         from?: string;
         to?: string;
     }) {
@@ -147,6 +292,20 @@ export class BacktestService {
         return {
             protocols: Array.from(allProtocols).sort(),
             mappings: protocolToAssets,
+            enums: {
+                poolTypes: Object.values(PoolType),
+                poolTypeDetails: POOL_TYPE_DETAILS,
+                strategyTypes: Object.values(StrategyType),
+                strategyTypeDetails: STRATEGY_TYPE_DETAILS,
+                poolToStrategyMap: POOL_TO_STRATEGY_MAP,
+                riskLevels: ['low', 'medium', 'high'],
+                durations: [
+                    { label: '30 days', value: 30 },
+                    { label: '90 days', value: 90 },
+                    { label: '180 days', value: 180 },
+                    { label: '365 days', value: 365 },
+                ],
+            },
         };
     }
 
@@ -489,6 +648,11 @@ export class BacktestService {
         const dailyReturns = timeSeries.slice(1).map(t => t.dailyReturnPct / 100);
         const sharpeRatio = this.calcSharpe(dailyReturns);
 
+        const totalIlLossUsd = allocStates.reduce((s, a) => s + a.ilLossUsd, 0);
+        const riskScore = this.calculateRiskScore(
+            sharpeRatio, maxDrawdown, includeIL, totalIlLossUsd, initialAmountUsd,
+        );
+
         // ── Per-allocation breakdown ──────────────────────────────────────────
         const breakdown = allocStates.map((state) => {
             const allocatedUsd = initialAmountUsd * (state.percentage / 100);
@@ -554,6 +718,8 @@ export class BacktestService {
                 annualizedApyPercent: parseFloat(annualizedApy.toFixed(4)),
                 maxDrawdownPercent: parseFloat((-maxDrawdown).toFixed(4)),
                 sharpeRatio: parseFloat(sharpeRatio.toFixed(4)),
+                riskScore,
+                riskLevel: riskScore <= 3 ? 'low' : riskScore <= 6 ? 'medium' : 'high',
                 durationDays,
                 from: fromDate.toISOString(),
                 to: toDate.toISOString(),
@@ -571,6 +737,37 @@ export class BacktestService {
             // Cap at 500 points for chart rendering
             timeSeries: this.downsampleTimeSeries(timeSeries, 500),
         };
+    }
+
+    // ─── Risk Score ─────────────────────────────────────────────────────────
+
+    /**
+     * Composite risk score (1-10) from Sharpe ratio, max drawdown, and IL.
+     *   1 = very safe, 10 = very risky
+     */
+    private calculateRiskScore(
+        sharpeRatio: number,
+        maxDrawdownPct: number,
+        ilIncluded: boolean,
+        totalIlLossUsd: number,
+        initialAmountUsd: number,
+    ): number {
+        // Sharpe component: higher Sharpe = lower risk (0-3 points)
+        const sharpeScore = Math.max(0, Math.min(3, (2 - sharpeRatio) * 1.5));
+
+        // Drawdown component: higher drawdown = higher risk (0-4 points)
+        const ddPct = Math.abs(maxDrawdownPct);
+        const ddScore = Math.max(0, Math.min(4, ddPct / 5));
+
+        // IL component: (0-3 points)
+        let ilScore = 0;
+        if (ilIncluded && initialAmountUsd > 0) {
+            const ilPct = (totalIlLossUsd / initialAmountUsd) * 100;
+            ilScore = Math.max(0, Math.min(3, ilPct / 3));
+        }
+
+        const raw = sharpeScore + ddScore + ilScore;
+        return Math.max(1, Math.min(10, Math.round(raw + 1)));
     }
 
     // ─── Helpers ─────────────────────────────────────────────────────────────

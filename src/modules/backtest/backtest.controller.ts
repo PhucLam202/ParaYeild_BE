@@ -29,7 +29,7 @@ import {
     ArrayMinSize,
 } from 'class-validator';
 import { Type } from 'class-transformer';
-import { BacktestService, PoolType } from './backtest.service';
+import { BacktestService, PoolType, StrategyType } from './backtest.service';
 import { StrategyService } from './strategy.service';
 import { Public } from '../../common/decorators/public.decorator';
 
@@ -75,6 +75,20 @@ class RunBacktestDto {
     @ApiProperty({ example: '2026-04-01', description: 'End date (YYYY-MM-DD)' })
     @IsDateString()
     to: string;
+
+    @ApiProperty({
+        enum: StrategyType,
+        enumName: 'StrategyType',
+        example: StrategyType.YIELD_FARMING,
+        required: false,
+        description:
+            'Overall strategy type for this backtest run. ' +
+            'Used for FE categorization/filtering. ' +
+            'Values: yield_farming, liquid_staking, lending, dex_lp, multi_chain',
+    })
+    @IsOptional()
+    @IsEnum(StrategyType)
+    strategyType?: StrategyType;
 
     @ApiProperty({
         type: [BacktestAllocationDto],
@@ -282,16 +296,18 @@ Mỗi chain bao gồm:
     @ApiQuery({ name: 'protocol', required: false, example: 'hydration' })
     @ApiQuery({ name: 'asset', required: false, example: 'DOT-ETH' })
     @ApiQuery({ name: 'poolType', required: false, example: 'farming' })
+    @ApiQuery({ name: 'network', required: false, example: 'hydration', description: 'Filter by network/parachain' })
     @ApiQuery({ name: 'from', required: false, example: '2026-01-01' })
     @ApiQuery({ name: 'to', required: false, example: '2026-04-01' })
     async getApyHistory(
         @Query('protocol') protocol?: string,
         @Query('asset') asset?: string,
         @Query('poolType') poolType?: string,
+        @Query('network') network?: string,
         @Query('from') from?: string,
         @Query('to') to?: string,
     ) {
-        return this.backtestService.fetchApyHistory({ protocol, asset, poolType, from, to });
+        return this.backtestService.fetchApyHistory({ protocol, asset, poolType, network, from, to });
     }
 
     /**

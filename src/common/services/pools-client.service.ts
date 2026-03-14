@@ -8,13 +8,42 @@ export interface PoolSnapshot {
     network: string;
     poolType: string;
     assetSymbol: string;
-    totalApy?: number;
-    supplyApy?: number;
-    rewardApy?: number;
-    tvlUsd?: number;
-    metadata?: Record<string, any>;
+    snapshotDate?: string | null;
+    // APY fields
+    supplyApy?: number | null;
+    borrowApy?: number | null;
+    rewardApy?: number | null;
+    totalApy?: number | null;
+    // Market data
+    tvlUsd?: number | null;
+    utilizationRate?: number | null;
+    volume24hUsd?: number | null;
+    priceUsd?: number | null;
+    // APY averages from protocol
+    weekApy?: number | null;
+    monthApy?: number | null;
+    quarterApy?: number | null;
+    // On-chain metadata
+    marketAddress?: string | null;
+    chainId?: number | null;
+    collateralFactor?: number | null;
+    reserveFactor?: string | number | null;
+    poolCategory?: string | null;
+    assetName?: string | null;
+    feeAndFarmApr?: number | null;
+    // Timestamps
     dataTimestamp?: string;
+    updatedAt?: string | null;
     crawledAt?: string;
+    // Computed analytics (from Data Server v1.2+)
+    apy30dAvg?: number | null;
+    apyTrend?: 'up' | 'down' | 'stable';
+    riskScore?: number | null;
+    riskLabel?: 'Low' | 'Medium' | 'High';
+    // Visual assets
+    protocolLogo?: string | null;
+    tokenIcon?: string | null;
+    metadata?: Record<string, any>;
 }
 
 // ─── Shape from external server GET /pools/history ───
@@ -23,10 +52,18 @@ export interface PoolHistoryRecord {
     network: string;
     poolType: string;
     assetSymbol: string;
+    snapshotDate?: string | null;
     supplyApy: number;     // primary APY field from history endpoint
+    borrowApy?: number | null;
     rewardApy?: number;
     totalApy?: number;
+    tvlUsd?: number | null;
+    utilizationRate?: number | null;
+    volume24hUsd?: number | null;
+    priceUsd?: number | null;
+    feeAndFarmApr?: number | null;
     dataTimestamp: string; // ISO string e.g. "2026-02-20T04:04:45.526Z"
+    updatedAt?: string | null;
 }
 
 export interface PoolsQueryParams {
@@ -45,6 +82,7 @@ export interface PoolHistoryQueryParams {
     protocol?: string;
     asset?: string;
     poolType?: string;
+    network?: string;
     from?: string;
     to?: string;
 }
@@ -76,6 +114,8 @@ export class PoolsClientService {
         if (params.sortBy) {
             let sortProp = params.sortBy;
             if (sortProp === 'apy') sortProp = 'totalApy';
+            const validSortFields = ['totalApy', 'supplyApy', 'rewardApy', 'tvlUsd', 'crawledAt', 'apy30dAvg', 'riskScore'];
+            if (!validSortFields.includes(sortProp)) sortProp = 'totalApy';
             query.set('sortBy', sortProp);
         }
         if (params.from) query.set('from', params.from);
@@ -101,6 +141,7 @@ export class PoolsClientService {
         if (params.protocol) query.set('protocol', params.protocol);
         if (params.asset) query.set('asset', params.asset);
         if (params.poolType) query.set('poolType', params.poolType);
+        if (params.network) query.set('network', params.network);
         if (params.from) query.set('from', params.from);
         if (params.to) query.set('to', params.to);
 

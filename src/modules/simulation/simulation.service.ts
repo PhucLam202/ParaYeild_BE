@@ -19,19 +19,29 @@ export interface RunSimulationDto {
 
 // Core Polkadot-ecosystem tokens — pools must contain at least one of these
 const CORE_TOKENS = new Set([
-    'dot', 'vdot', 'ldot',
+    // Polkadot native
+    'dot', 'vdot', 'ldot', 'adot', 'gdot',
     'bnc', 'vbnc',
-    'eth', 'veth',
+    'eth', 'veth', 'geth', 'weth',
     'ksm', 'vksm',
     'glmr', 'vglmr',
     'astr', 'vastr',
     'aca',
     'movr',
-    'usdt', 'usdc',
+    // Stablecoins
+    'usdt', 'usdc', 'husdt', 'husdc', 'husds', 'husde',
+    // Hydration ecosystem
+    'hdx', 'hollar', 'sol', 'gsol',
+    // Bridged assets
+    'wbtc', 'tbtc', 'paxg',
+    // DeFi tokens on Polkadot parachains
+    'aave', 'link', 'ldo', 'ena', 'sky', 'sui', 'trac',
 ]);
 
 function hasCoreToken(assetSymbol: string): boolean {
     const lower = assetSymbol.toLowerCase();
+    // Hydration multi-asset stable pools (2-Pool, 3-Pool, 4-Pool, etc.)
+    if (/^\d+-pool/.test(lower)) return true;
     for (const token of CORE_TOKENS) {
         // Match whole token name separated by '-', '/', or at start/end of string
         const re = new RegExp(`(^|[-/])${token}($|[-/])`);

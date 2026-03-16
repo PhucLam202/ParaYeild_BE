@@ -177,9 +177,6 @@ class RunBacktestDto {
     @ApiProperty({
         example: 0.5,
         required: false,
-        description:
-            'Slippage tolerance % applied on initial deployment, rebalancing, and when ' +
-            'swapping reward tokens back to LP during harvest.',
     })
     @IsOptional()
     @IsNumber()

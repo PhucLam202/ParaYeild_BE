@@ -181,6 +181,11 @@ export interface RunBacktestDto {
     compoundFrequencyDays?: number;   // harvest every N days (default: 7)
     compoundFeeUsd?: number;          // gas fee per harvest event (default: 0.50)
     slippageTolerancePercent?: number; // 0-5%
+    baseApyOverride?: number;         // [Pro Mode]
+    reinvestmentRate?: number;        // [Pro Mode] 0-100
+    volatilityAssumption?: 'low' | 'medium' | 'high'; // [Pro Mode]
+    maxAcceptableIl?: number;         // [Pro Mode]
+    priceRange?: { min: number; max: number }; // [Pro Mode]
 }
 
 // ─── Internal types ──────────────────────────────────────────────────────────
@@ -320,9 +325,14 @@ export class BacktestService {
             includeIL = false,
             xcmFeeUsd = 0.5,
             isCompound = true,
-            compoundFrequencyDays = 7,   // NEW: harvest rewards every 7 days by default
-            compoundFeeUsd = 0.5,        // NEW: $0.50 gas per harvest
+            compoundFrequencyDays = 7,
+            compoundFeeUsd = 0.5,
             slippageTolerancePercent = 0,
+            baseApyOverride,
+            reinvestmentRate = 100,
+            volatilityAssumption = 'medium',
+            maxAcceptableIl,
+            priceRange,
         } = dto;
 
         // ── Validation ──
@@ -516,7 +526,21 @@ export class BacktestService {
 
             // ── Apply daily growth for each allocation ──
             for (const state of allocStates) {
-                const { supplyApy, rewardApy } = this.getApySplitForDay(state.apyHistory, dateStr);
+                let { supplyApy, rewardApy } = this.getApySplitForDay(state.apyHistory, dateStr);
+
+                // [Pro Mode] APY Override: Scale historical APY by override factor
+                if (baseApyOverride !== undefined && baseApyOverride > 0) {
+                    const avgHistApy = this.avg([...state.supplyApySamples, ...state.rewardApySamples]);
+                    const scale = avgHistApy > 0 ? baseApyOverride / avgHistApy : 1;
+                    if (avgHistApy === 0) {
+                        // If no history, use override directly split 50/50 or as reward
+                        rewardApy = baseApyOverride;
+                    } else {
+                        supplyApy *= scale;
+                        rewardApy *= scale;
+                    }
+                }
+
                 state.supplyApySamples.push(supplyApy);
                 state.rewardApySamples.push(rewardApy);
 
@@ -536,14 +560,24 @@ export class BacktestService {
                             // ── Harvest Event ──
                             if (state.unclaimedRewardsUsd > compoundFeeUsd) {
                                 const afterGas = state.unclaimedRewardsUsd - compoundFeeUsd;
-                                // Swap reward token → LP token pair (slippage)
-                                const afterSlippage = afterGas * (1 - slippageTolerancePercent / 100);
+                                
+                                // [Pro Mode] Reinvestment Rate
+                                const reRate = reinvestmentRate ?? 100;
+                                const amountToReinvest = afterGas * (reRate / 100);
+                                const amountToKeep = afterGas - amountToReinvest;
+
+                                // Swap reinvestment portion → LP token pair (slippage)
+                                const afterSlippage = amountToReinvest * (1 - slippageTolerancePercent / 100);
+                                
                                 // Reinvest into LP
                                 state.valueUsd += afterSlippage;
                                 state.totalCompoundedRewardsUsd += afterSlippage;
+                                state.accruedRewardsUsd += amountToKeep; // Non-reinvested portion recorded as profit
+                                
                                 state.totalHarvestFeesUsd += compoundFeeUsd;
-                                slippageCostUsd += afterGas * (slippageTolerancePercent / 100);
+                                slippageCostUsd += amountToReinvest * (slippageTolerancePercent / 100);
                                 totalHarvestEventsCount++;
+                                
                                 this.logger.debug(
                                     `[${state.assetSymbol}] Harvest day ${i}: unclaimed=$${state.unclaimedRewardsUsd.toFixed(2)}, ` +
                                     `afterGas=$${afterGas.toFixed(2)}, reinvested=$${afterSlippage.toFixed(2)}`,
@@ -621,9 +655,32 @@ export class BacktestService {
         if (includeIL) {
             for (const state of allocStates) {
                 if (isYieldFarmingPool(state.poolType)) {
-                    const priceRatio = this.estimatePriceRatio(state.supplyApySamples);
+                    // [Pro Mode] Dynamic Price Ratio based on Volatility or range
+                    let priceRatio = this.estimatePriceRatio(state.supplyApySamples);
+                    
+                    if (volatilityAssumption) {
+                        const volMap = { low: 0.5, medium: 1.0, high: 2.0 };
+                        const driftFactor = volMap[volatilityAssumption] || 1.0;
+                        priceRatio = 1 + (priceRatio - 1) * driftFactor;
+                    }
+
+                    if (priceRange) {
+                        // If custom range is provided, use worst-case IL within that range
+                        const rangeMaxRatio = Math.max(priceRange.max, 1 / priceRange.min);
+                        priceRatio = Math.max(priceRatio, rangeMaxRatio);
+                    }
+
                     const il = this.calculateIL(priceRatio);
-                    const ilLoss = state.valueUsd * Math.abs(il);
+                    let ilLoss = state.valueUsd * Math.abs(il);
+
+                    // [Pro Mode] Max Acceptable IL Guard
+                    if (maxAcceptableIl !== undefined) {
+                        const cappedIlLoss = state.valueUsd * (maxAcceptableIl / 100);
+                        if (ilLoss > cappedIlLoss) {
+                            ilLoss = cappedIlLoss; // Simulate hedging or exit at stop-loss
+                        }
+                    }
+
                     state.ilLossUsd = parseFloat(ilLoss.toFixed(4));
                     state.valueUsd -= ilLoss;
                     this.logger.debug(

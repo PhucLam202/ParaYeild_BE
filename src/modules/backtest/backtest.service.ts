@@ -169,6 +169,16 @@ export interface BacktestAllocation {
     poolType?: PoolType; // 'dex' | 'farming' trigger IL + split-APY logic
 }
 
+export interface StrategyStep {
+    id: string;
+    action: 'stake' | 'farm' | 'compound' | 'borrow' | 'repay' | 'swap' | 'withdraw';
+    protocol: string;
+    asset: string;
+    percentage: number;
+    chain?: string;
+    description?: string;
+}
+
 export interface RunBacktestDto {
     initialAmountUsd: number;
     from: string;
@@ -179,6 +189,7 @@ export interface RunBacktestDto {
     xcmFeeUsd?: number;               // XCM fee per rebalance event
     isCompound?: boolean;             // compound farming rewards back into LP
     compoundFrequencyDays?: number;   // harvest every N days (default: 7)
+    compoundFrequency?: string;       // "daily" | "weekly" | "monthly"
     compoundFeeUsd?: number;          // gas fee per harvest event (default: 0.50)
     slippageTolerancePercent?: number; // 0-5%
     baseApyOverride?: number;         // [Pro Mode]
@@ -186,6 +197,7 @@ export interface RunBacktestDto {
     volatilityAssumption?: 'low' | 'medium' | 'high'; // [Pro Mode]
     maxAcceptableIl?: number;         // [Pro Mode]
     priceRange?: { min: number; max: number }; // [Pro Mode]
+    steps?: StrategyStep[];           // [Pro Mode] Multi-step yield loop
 }
 
 // ─── Internal types ──────────────────────────────────────────────────────────
@@ -226,7 +238,15 @@ interface AllocState {
     isFallbackData: boolean;
     /** Rewards accumulated without compounding (isCompound=false) */
     accruedRewardsUsd: number;
+    /** Incremental min/max tracking for supply APY (avoids Math.min/max over full array) */
+    minSupplyApy: number;
+    maxSupplyApy: number;
 }
+
+// ─── Constants (module-level) ─────────────────────────────────────────────────
+
+const VOL_DRIFT_MAP: Record<string, number> = { low: 0.5, medium: 1.0, high: 2.0 };
+const VOL_SIGMA_MAP: Record<string, number> = { low: 0.3, medium: 0.6, high: 1.0 };
 
 // ─── Helpers (module-level) ───────────────────────────────────────────────────
 
@@ -254,6 +274,11 @@ export class BacktestService {
     private readonly RISK_FREE_RATE = 0.05; // 5% annualized
 
     constructor(private readonly poolsClient: PoolsClientService) { }
+
+    private round(value: number, decimals = 4): number {
+        const factor = 10 ** decimals;
+        return Math.round(value * factor) / factor;
+    }
 
     // ─── Proxy /pools/history endpoint ───
     async fetchApyHistory(params: {
@@ -325,15 +350,44 @@ export class BacktestService {
             includeIL = false,
             xcmFeeUsd = 0.5,
             isCompound = true,
-            compoundFrequencyDays = 7,
             compoundFeeUsd = 0.5,
             slippageTolerancePercent = 0,
             baseApyOverride,
-            reinvestmentRate = 100,
             volatilityAssumption = 'medium',
             maxAcceptableIl,
             priceRange,
+            steps,
         } = dto;
+
+        // ── Resolve compoundFrequencyDays from string or number ──
+        const freqMap: Record<string, number> = { daily: 1, weekly: 7, monthly: 30 };
+        const compoundFrequencyDays = dto.compoundFrequencyDays
+            ?? (dto.compoundFrequency ? freqMap[dto.compoundFrequency] : undefined)
+            ?? 7;
+
+        // ── Pro Mode: reinvestmentRate overrides isCompound ──
+        let effectiveCompound: boolean;
+        let effectiveReinvestRate: number;
+        if (dto.reinvestmentRate !== undefined) {
+            effectiveCompound = dto.reinvestmentRate > 0;
+            effectiveReinvestRate = dto.reinvestmentRate / 100;
+        } else {
+            effectiveCompound = isCompound;
+            effectiveReinvestRate = effectiveCompound ? 1.0 : 0;
+        }
+
+        // ── Steps processing (Pro Mode multi-step yield loop) ──
+        let stepsParams: ReturnType<BacktestService['resolveStepsToSimulationParams']> | null = null;
+        if (steps && steps.length > 0) {
+            stepsParams = this.resolveStepsToSimulationParams(steps, initialAmountUsd);
+            // Steps compound action overrides effectiveCompound
+            if (stepsParams.forceCompound) {
+                effectiveCompound = true;
+                if (stepsParams.compoundPercentage !== null) {
+                    effectiveReinvestRate = stepsParams.compoundPercentage / 100;
+                }
+            }
+        }
 
         // ── Validation ──
         const totalPct = allocations.reduce((s, a) => s + a.percentage, 0);
@@ -496,6 +550,8 @@ export class BacktestService {
                 dataSource,
                 isFallbackData,
                 accruedRewardsUsd: 0,
+                minSupplyApy: Infinity,
+                maxSupplyApy: -Infinity,
             };
         }));
 
@@ -513,13 +569,31 @@ export class BacktestService {
             unclaimedRewardsUsd: number;
         }[] = [];
 
+        let earlyTerminated = false;
+        let earlyTerminationDay: number | undefined;
+        let earlyTerminationReason: string | undefined;
+
         let peakValue = initialAmountUsd;
         let maxDrawdown = 0;
         let xcmFeesPaidUsd = 0;
         let slippageCostUsd = initialAmountUsd * (slippageTolerancePercent / 100);
+
+        // ── Apply steps adjustments to initial state ──
+        if (stepsParams) {
+            for (const state of allocStates) {
+                state.valueUsd *= stepsParams.leverageMultiplier * stepsParams.capitalAdjustmentFactor;
+            }
+            slippageCostUsd += stepsParams.slippageCostUsd;
+        }
+
         let rebalanceCount = 0;
         let prevTotalValue = initialAmountUsd;
         let totalHarvestEventsCount = 0;
+
+        // P1: Pre-compute concentrated liquidity in-range fraction (constant across all days)
+        const precomputedInRangeFraction = priceRange
+            ? this.estimateTimeInRange(priceRange, volatilityAssumption)
+            : 1.0;
 
         for (let i = 0; i < days.length; i++) {
             const dateStr = days[i];
@@ -544,6 +618,10 @@ export class BacktestService {
                 state.supplyApySamples.push(supplyApy);
                 state.rewardApySamples.push(rewardApy);
 
+                // P4: Incremental min/max tracking
+                if (supplyApy < state.minSupplyApy) state.minSupplyApy = supplyApy;
+                if (supplyApy > state.maxSupplyApy) state.maxSupplyApy = supplyApy;
+
                 if (i > 0) {
                     const supplyDailyRate = supplyApy / 100 / 365;
                     const rewardDailyRate = rewardApy / 100 / 365;
@@ -551,19 +629,23 @@ export class BacktestService {
                     if (isYieldFarmingPool(state.poolType)) {
                         // ── Yield Farming Mode ──
                         // 1. Trading fees auto-compound into LP token value directly
-                        state.valueUsd *= (1 + supplyDailyRate);
+                        //    Concentrated liquidity: adjust by estimated time in-range
+                        let adjustedSupplyDailyRate = supplyDailyRate;
+                        if (priceRange) {
+                            adjustedSupplyDailyRate = supplyDailyRate * precomputedInRangeFraction;
+                        }
+                        state.valueUsd *= (1 + adjustedSupplyDailyRate);
 
                         // 2. Farm emission rewards accrue separately (like a pending harvest)
                         state.unclaimedRewardsUsd += state.valueUsd * rewardDailyRate;
 
-                        if (isCompound && compoundFrequencyDays > 0 && i % compoundFrequencyDays === 0) {
+                        if (effectiveCompound && compoundFrequencyDays > 0 && i % compoundFrequencyDays === 0) {
                             // ── Harvest Event ──
                             if (state.unclaimedRewardsUsd > compoundFeeUsd) {
                                 const afterGas = state.unclaimedRewardsUsd - compoundFeeUsd;
-                                
+
                                 // [Pro Mode] Reinvestment Rate
-                                const reRate = reinvestmentRate ?? 100;
-                                const amountToReinvest = afterGas * (reRate / 100);
+                                const amountToReinvest = afterGas * effectiveReinvestRate;
                                 const amountToKeep = afterGas - amountToReinvest;
 
                                 // Swap reinvestment portion → LP token pair (slippage)
@@ -584,21 +666,70 @@ export class BacktestService {
                                 );
                                 state.unclaimedRewardsUsd = 0;
                             }
-                        } else if (!isCompound) {
+                        } else if (!effectiveCompound) {
                             // No compounding – rewards remain in unclaimed bucket
                             state.accruedRewardsUsd = state.unclaimedRewardsUsd;
                         }
+                        // B6: When unclaimedRewardsUsd <= compoundFeeUsd, rewards stay in
+                        // the unclaimed bucket. This is economically correct (gas > rewards),
+                        // and unclaimed rewards are still counted in totalValue snapshots.
                     } else {
                         // ── Single Pool Mode (vstaking etc.) ──
                         // Combine supply+reward into total APY and compound as before
                         const totalDailyRate = (supplyApy + rewardApy) / 100 / 365;
-                        if (isCompound) {
+                        if (effectiveCompound) {
                             state.valueUsd *= (1 + totalDailyRate);
                         } else {
                             state.accruedRewardsUsd += state.valueUsd * totalDailyRate;
                         }
                     }
                 }
+            }
+
+            // ── Daily borrow cost from steps ──
+            if (stepsParams && stepsParams.dailyBorrowCostRate > 0 && i > 0) {
+                for (const state of allocStates) {
+                    const borrowCost = state.valueUsd * stepsParams.dailyBorrowCostRate;
+                    state.valueUsd = Math.max(0, state.valueUsd - borrowCost);
+                }
+                // B1: Early termination if all allocations depleted by borrow costs
+                if (allocStates.every(s => s.valueUsd === 0)) {
+                    earlyTerminated = true;
+                    earlyTerminationDay = i;
+                    earlyTerminationReason = 'Portfolio depleted by borrow costs';
+                    this.logger.warn(`[Early Termination] ${earlyTerminationReason} on day ${i}`);
+                    break;
+                }
+            }
+
+            // ── Early termination: running IL check for farming pools ──
+            if (includeIL && maxAcceptableIl !== undefined && i > 0 && !earlyTerminated) {
+                for (const state of allocStates) {
+                    if (isYieldFarmingPool(state.poolType) && state.supplyApySamples.length >= 2) {
+                        let priceRatio = this.estimatePriceRatio(state.supplyApySamples);
+                        if (volatilityAssumption) {
+                            const driftFactor = VOL_DRIFT_MAP[volatilityAssumption] || 1.0;
+                            priceRatio = 1 + (priceRatio - 1) * driftFactor;
+                        }
+                        const runningIl = Math.abs(this.calculateIL(priceRatio));
+                        const runningIlPct = runningIl * 100;
+                        if (runningIlPct > maxAcceptableIl) {
+                            // Apply capped IL and terminate
+                            const cappedIlLoss = state.valueUsd * (maxAcceptableIl / 100);
+                            const safeCappedIlLoss = Math.min(cappedIlLoss, state.valueUsd);
+                            state.ilLossUsd = this.round(safeCappedIlLoss);
+                            state.valueUsd -= safeCappedIlLoss;
+                            earlyTerminated = true;
+                            earlyTerminationDay = i;
+                            earlyTerminationReason =
+                                `IL exceeded ${maxAcceptableIl}% threshold (estimated ${runningIlPct.toFixed(2)}%) ` +
+                                `on day ${i} for ${state.assetSymbol}`;
+                            this.logger.warn(`[Early Termination] ${earlyTerminationReason}`);
+                            break;
+                        }
+                    }
+                }
+                if (earlyTerminated) break;
             }
 
             // ── Rebalancing ──
@@ -609,41 +740,46 @@ export class BacktestService {
                 const totalBefore = allocStates.reduce((s, a) => s + a.valueUsd + a.unclaimedRewardsUsd, 0);
                 const crossChainCount = this.countCrossChainHops(allocStates);
                 const feesThisRebalance = xcmFeeUsd * crossChainCount;
-                xcmFeesPaidUsd += feesThisRebalance;
-                rebalanceCount++;
 
-                const totalAfterFees = totalBefore - feesThisRebalance;
-                let totalSlippage = 0;
-                for (const state of allocStates) {
-                    const targetValue = totalAfterFees * (state.percentage / 100);
-                    const tradeVolume = Math.abs(state.valueUsd - targetValue);
-                    totalSlippage += tradeVolume * (slippageTolerancePercent / 100);
-                }
-                totalSlippage /= 2;
-                slippageCostUsd += totalSlippage;
+                // B2: Skip rebalance if fees exceed portfolio value
+                if (feesThisRebalance < totalBefore) {
+                    xcmFeesPaidUsd += feesThisRebalance;
+                    rebalanceCount++;
 
-                const totalAfterSlippage = totalAfterFees - totalSlippage;
-                for (const state of allocStates) {
-                    state.valueUsd = totalAfterSlippage * (state.percentage / 100);
-                    state.unclaimedRewardsUsd = 0; // clear unclaimed on rebalance
+                    const totalAfterFees = totalBefore - feesThisRebalance;
+                    let totalSlippage = 0;
+                    for (const state of allocStates) {
+                        const targetValue = totalAfterFees * (state.percentage / 100);
+                        const tradeVolume = Math.abs(state.valueUsd - targetValue);
+                        totalSlippage += tradeVolume * (slippageTolerancePercent / 100);
+                    }
+                    totalSlippage /= 2;
+                    // B2: Clamp slippage so totalAfterSlippage >= 0
+                    totalSlippage = Math.min(totalSlippage, totalAfterFees);
+                    slippageCostUsd += totalSlippage;
+
+                    const totalAfterSlippage = totalAfterFees - totalSlippage;
+                    for (const state of allocStates) {
+                        state.valueUsd = totalAfterSlippage * (state.percentage / 100);
+                        state.unclaimedRewardsUsd = 0; // clear unclaimed on rebalance
+                    }
                 }
             }
 
-            // ── Snapshot ──
-            const totalValue = allocStates.reduce(
-                (s, a) => s + a.valueUsd + a.unclaimedRewardsUsd + a.accruedRewardsUsd,
-                0,
-            );
+            // ── Snapshot (P3: single-pass total value) ──
+            let totalValue = 0, snapshotUnclaimed = 0;
+            for (const a of allocStates) {
+                totalValue += a.valueUsd + a.unclaimedRewardsUsd + a.accruedRewardsUsd;
+                snapshotUnclaimed += a.unclaimedRewardsUsd;
+            }
             const dailyReturnPct = i === 0 ? 0 : ((totalValue - prevTotalValue) / prevTotalValue) * 100;
             prevTotalValue = totalValue;
 
             timeSeries.push({
                 date: dateStr,
-                totalValueUsd: parseFloat(totalValue.toFixed(4)),
-                dailyReturnPct: parseFloat(dailyReturnPct.toFixed(4)),
-                unclaimedRewardsUsd: parseFloat(
-                    allocStates.reduce((s, a) => s + a.unclaimedRewardsUsd, 0).toFixed(4),
-                ),
+                totalValueUsd: this.round(totalValue),
+                dailyReturnPct: this.round(dailyReturnPct),
+                unclaimedRewardsUsd: this.round(snapshotUnclaimed),
             });
 
             if (totalValue > peakValue) peakValue = totalValue;
@@ -652,15 +788,14 @@ export class BacktestService {
         }
 
         // ── Impermanent Loss (end-of-period, DEX/Farming pools) ──
-        if (includeIL) {
+        if (includeIL && !earlyTerminated) {
             for (const state of allocStates) {
                 if (isYieldFarmingPool(state.poolType)) {
                     // [Pro Mode] Dynamic Price Ratio based on Volatility or range
                     let priceRatio = this.estimatePriceRatio(state.supplyApySamples);
                     
                     if (volatilityAssumption) {
-                        const volMap = { low: 0.5, medium: 1.0, high: 2.0 };
-                        const driftFactor = volMap[volatilityAssumption] || 1.0;
+                        const driftFactor = VOL_DRIFT_MAP[volatilityAssumption] || 1.0;
                         priceRatio = 1 + (priceRatio - 1) * driftFactor;
                     }
 
@@ -681,7 +816,9 @@ export class BacktestService {
                         }
                     }
 
-                    state.ilLossUsd = parseFloat(ilLoss.toFixed(4));
+                    // B3: Floor guard — IL cannot exceed remaining value
+                    ilLoss = Math.min(ilLoss, state.valueUsd);
+                    state.ilLossUsd = this.round(ilLoss);
                     state.valueUsd -= ilLoss;
                     this.logger.debug(
                         `[${state.assetSymbol}] IL: priceRatio=${priceRatio.toFixed(3)}, loss=$${ilLoss.toFixed(2)}`,
@@ -691,10 +828,11 @@ export class BacktestService {
         }
 
         // ── Final metrics ─────────────────────────────────────────────────────
-        const finalTotalUsd = allocStates.reduce(
+        // B5: Safety net — final total can never be negative
+        const finalTotalUsd = Math.max(0, allocStates.reduce(
             (s, a) => s + a.valueUsd + a.unclaimedRewardsUsd + a.accruedRewardsUsd,
             0,
-        );
+        ));
         const totalReturnUsd = finalTotalUsd - initialAmountUsd;
         const totalReturnPct = (totalReturnUsd / initialAmountUsd) * 100;
         const annualizedApy =
@@ -729,32 +867,37 @@ export class BacktestService {
                 dataSource: state.dataSource,
                 poolType: state.poolType,
                 allocationPercent: state.percentage,
-                allocatedUsd: parseFloat(allocatedUsd.toFixed(4)),
-                finalUsd: parseFloat(finalUsd.toFixed(4)),
-                returnUsd: parseFloat(returnUsd.toFixed(4)),
-                returnPercent: parseFloat(returnPct.toFixed(4)),
+                allocatedUsd: this.round(allocatedUsd),
+                finalUsd: this.round(finalUsd),
+                returnUsd: this.round(returnUsd),
+                returnPercent: this.round(returnPct),
                 // APY breakdown
-                avgSupplyApyPercent: parseFloat(avgSupplyApy.toFixed(4)),
-                avgRewardApyPercent: parseFloat(avgRewardApy.toFixed(4)),
-                avgTotalApyPercent: parseFloat((avgSupplyApy + avgRewardApy).toFixed(4)),
-                minSupplyApyPercent: parseFloat((state.supplyApySamples.length > 0 ? Math.min(...state.supplyApySamples) : 0).toFixed(4)),
-                maxSupplyApyPercent: parseFloat((state.supplyApySamples.length > 0 ? Math.max(...state.supplyApySamples) : 0).toFixed(4)),
+                avgSupplyApyPercent: this.round(avgSupplyApy),
+                avgRewardApyPercent: this.round(avgRewardApy),
+                avgTotalApyPercent: this.round(avgSupplyApy + avgRewardApy),
+                // P4: Use incremental min/max instead of Math.min/max(...array)
+                minSupplyApyPercent: this.round(state.supplyApySamples.length > 0 ? state.minSupplyApy : 0),
+                maxSupplyApyPercent: this.round(state.supplyApySamples.length > 0 ? state.maxSupplyApy : 0),
                 // Yield Farming specific
                 ...(isYF && {
                     yieldFarmingStats: {
-                        totalFarmingRewardsEarnedUsd: parseFloat(
-                            (state.totalCompoundedRewardsUsd + state.unclaimedRewardsUsd + state.accruedRewardsUsd).toFixed(4),
+                        totalFarmingRewardsEarnedUsd: this.round(
+                            state.totalCompoundedRewardsUsd + state.unclaimedRewardsUsd + state.accruedRewardsUsd,
                         ),
-                        totalCompoundedRewardsUsd: parseFloat(state.totalCompoundedRewardsUsd.toFixed(4)),
-                        remainingUnclaimedRewardsUsd: parseFloat(state.unclaimedRewardsUsd.toFixed(4)),
-                        harvestFeesPaidUsd: parseFloat(state.totalHarvestFeesUsd.toFixed(4)),
-                        harvestEventsCount: isCompound
+                        totalCompoundedRewardsUsd: this.round(state.totalCompoundedRewardsUsd),
+                        remainingUnclaimedRewardsUsd: this.round(state.unclaimedRewardsUsd),
+                        harvestFeesPaidUsd: this.round(state.totalHarvestFeesUsd),
+                        harvestEventsCount: effectiveCompound
                             ? Math.floor(durationDays / compoundFrequencyDays)
                             : 0,
                     },
                 }),
+                // P1: Reuse precomputed in-range fraction
+                ...(priceRange && isYF && {
+                    estimatedTimeInRangePercent: this.round(precomputedInRangeFraction * 100, 2),
+                }),
                 ilLossUsd: state.ilLossUsd,
-                accruedRewardsUsd: parseFloat((state.accruedRewardsUsd + state.unclaimedRewardsUsd).toFixed(4)),
+                accruedRewardsUsd: this.round(state.accruedRewardsUsd + state.unclaimedRewardsUsd),
                 dataPointsUsed: state.supplyApySamples.length,
                 hasHistoricalData,
                 ...(state.isFallbackData && {
@@ -769,30 +912,49 @@ export class BacktestService {
         return {
             summary: {
                 initialAmountUsd,
-                finalAmountUsd: parseFloat(finalTotalUsd.toFixed(4)),
-                totalReturnUsd: parseFloat(totalReturnUsd.toFixed(4)),
-                totalReturnPercent: parseFloat(totalReturnPct.toFixed(4)),
-                annualizedApyPercent: parseFloat(annualizedApy.toFixed(4)),
-                maxDrawdownPercent: parseFloat((-maxDrawdown).toFixed(4)),
-                sharpeRatio: parseFloat(sharpeRatio.toFixed(4)),
+                finalAmountUsd: this.round(finalTotalUsd),
+                totalReturnUsd: this.round(totalReturnUsd),
+                totalReturnPercent: this.round(totalReturnPct),
+                annualizedApyPercent: this.round(annualizedApy),
+                maxDrawdownPercent: this.round(-maxDrawdown),
+                sharpeRatio: this.round(sharpeRatio),
                 riskScore,
                 riskLevel: riskScore <= 3 ? 'low' : riskScore <= 6 ? 'medium' : 'high',
                 durationDays,
                 from: fromDate.toISOString(),
                 to: toDate.toISOString(),
                 rebalancedCount: rebalanceCount,
-                xcmFeesPaidUsd: parseFloat(xcmFeesPaidUsd.toFixed(4)),
-                slippageCostUsd: parseFloat(slippageCostUsd.toFixed(4)),
+                xcmFeesPaidUsd: this.round(xcmFeesPaidUsd),
+                slippageCostUsd: this.round(slippageCostUsd),
                 totalHarvestEventsCount,
                 ilIncluded: includeIL,
-                isCompound,
-                compoundFrequencyDays: isCompound ? compoundFrequencyDays : null,
-                compoundFeeUsd: isCompound ? compoundFeeUsd : null,
+                isCompound: effectiveCompound,
+                compoundFrequencyDays: effectiveCompound ? compoundFrequencyDays : null,
+                compoundFeeUsd: effectiveCompound ? compoundFeeUsd : null,
                 slippageTolerancePercent,
+                ...(dto.reinvestmentRate !== undefined && {
+                    reinvestmentRate: dto.reinvestmentRate,
+                }),
+                ...(stepsParams && {
+                    leverageMultiplier: stepsParams.leverageMultiplier,
+                }),
             },
             breakdown,
             // Cap at 500 points for chart rendering
             timeSeries: this.downsampleTimeSeries(timeSeries, 500),
+            ...(earlyTerminated && {
+                earlyTermination: {
+                    triggered: true,
+                    reason: earlyTerminationReason,
+                    terminatedAtDay: earlyTerminationDay,
+                },
+            }),
+            ...(!earlyTerminated && includeIL && maxAcceptableIl !== undefined && {
+                earlyTermination: { triggered: false },
+            }),
+            ...(stepsParams && {
+                stepsAnalysis: stepsParams.analysis,
+            }),
         };
     }
 
@@ -984,6 +1146,151 @@ export class BacktestService {
             rewardApy: snapshot.rewardApy ?? 0,
             totalApy: snapshot.totalApy,
             dataTimestamp: new Date().toISOString(),
+        };
+    }
+
+    /**
+     * Estimate fraction of time price stays within a concentrated liquidity range.
+     * Uses a simplified normal distribution model in log-price space.
+     */
+    private estimateTimeInRange(
+        priceRange: { min: number; max: number },
+        volatilityAssumption: string,
+    ): number {
+        const sigma = VOL_SIGMA_MAP[volatilityAssumption] ?? 0.6;
+
+        // Range width in log-space
+        const logMin = Math.log(priceRange.min);
+        const logMax = Math.log(priceRange.max);
+        const rangeWidth = logMax - logMin;
+
+        if (rangeWidth <= 0) return 0.05;
+
+        // Approximate CDF of normal distribution using error function approximation
+        // Fraction in-range ≈ erf(rangeWidth / (sigma * sqrt(2)))
+        const x = rangeWidth / (sigma * Math.SQRT2);
+        // Abramowitz-Stegun approximation of erf
+        const t = 1 / (1 + 0.3275911 * Math.abs(x));
+        const poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+        const erf = 1 - poly * Math.exp(-x * x);
+        const fraction = Math.max(0.05, Math.min(1.0, erf));
+
+        return fraction;
+    }
+
+    /**
+     * Resolve strategy steps into simulation parameter adjustments.
+     * Returns leverage multiplier, daily borrow cost rate, capital adjustment,
+     * and analysis descriptions.
+     */
+    private resolveStepsToSimulationParams(
+        steps: StrategyStep[],
+        initialAmountUsd: number,
+    ): {
+        leverageMultiplier: number;
+        dailyBorrowCostRate: number;
+        capitalAdjustmentFactor: number;
+        slippageCostUsd: number;
+        forceCompound: boolean;
+        compoundPercentage: number | null;
+        analysis: Array<{ step: string; action: string; effect: string }>;
+    } {
+        let leverageMultiplier = 1.0;
+        let dailyBorrowCostRate = 0;
+        let capitalAdjustmentFactor = 1.0;
+        let slippageCostUsd = 0;
+        let forceCompound = false;
+        let compoundPercentage: number | null = null;
+        const analysis: Array<{ step: string; action: string; effect: string }> = [];
+
+        const ANNUAL_BORROW_RATE = 0.05; // 5% annual borrow cost
+
+        for (const step of steps) {
+            switch (step.action) {
+                case 'stake':
+                    analysis.push({
+                        step: step.id,
+                        action: 'stake',
+                        effect: `Stake ${step.percentage}% of ${step.asset} on ${step.protocol}. Confirms staking allocation.`,
+                    });
+                    break;
+
+                case 'farm':
+                    analysis.push({
+                        step: step.id,
+                        action: 'farm',
+                        effect: `Farm ${step.percentage}% of ${step.asset} on ${step.protocol}. Confirms farming APY model.`,
+                    });
+                    break;
+
+                case 'compound':
+                    forceCompound = true;
+                    compoundPercentage = step.percentage;
+                    analysis.push({
+                        step: step.id,
+                        action: 'compound',
+                        effect: `Auto-compound ${step.percentage}% of rewards. Overrides reinvestment rate.`,
+                    });
+                    break;
+
+                case 'borrow': {
+                    const borrowFraction = step.percentage / 100;
+                    leverageMultiplier += borrowFraction;
+                    dailyBorrowCostRate += (borrowFraction * ANNUAL_BORROW_RATE) / 365;
+                    analysis.push({
+                        step: step.id,
+                        action: 'borrow',
+                        effect: `Borrow ${step.percentage}% against collateral. Leverage: ${leverageMultiplier.toFixed(2)}x. Daily borrow cost added.`,
+                    });
+                    break;
+                }
+
+                case 'repay': {
+                    const repayFraction = step.percentage / 100;
+                    const reduction = Math.min(repayFraction, leverageMultiplier - 1);
+                    leverageMultiplier -= reduction;
+                    dailyBorrowCostRate = Math.max(0, dailyBorrowCostRate - (reduction * ANNUAL_BORROW_RATE) / 365);
+                    analysis.push({
+                        step: step.id,
+                        action: 'repay',
+                        effect: `Repay ${step.percentage}% of borrowed amount. Leverage: ${leverageMultiplier.toFixed(2)}x.`,
+                    });
+                    break;
+                }
+
+                case 'swap': {
+                    const swapAmount = initialAmountUsd * (step.percentage / 100);
+                    const swapSlippage = swapAmount * 0.003; // 0.3% swap cost
+                    slippageCostUsd += swapSlippage;
+                    analysis.push({
+                        step: step.id,
+                        action: 'swap',
+                        effect: `Swap ${step.percentage}% of ${step.asset}. Slippage cost: $${swapSlippage.toFixed(2)}.`,
+                    });
+                    break;
+                }
+
+                case 'withdraw': {
+                    capitalAdjustmentFactor -= step.percentage / 100;
+                    capitalAdjustmentFactor = Math.max(0, capitalAdjustmentFactor);
+                    analysis.push({
+                        step: step.id,
+                        action: 'withdraw',
+                        effect: `Withdraw ${step.percentage}% of capital. Effective capital: ${(capitalAdjustmentFactor * 100).toFixed(0)}%.`,
+                    });
+                    break;
+                }
+            }
+        }
+
+        return {
+            leverageMultiplier,
+            dailyBorrowCostRate,
+            capitalAdjustmentFactor,
+            slippageCostUsd,
+            forceCompound,
+            compoundPercentage,
+            analysis,
         };
     }
 

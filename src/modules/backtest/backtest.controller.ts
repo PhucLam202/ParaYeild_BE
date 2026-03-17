@@ -23,10 +23,12 @@ import {
     IsOptional,
     IsBoolean,
     IsEnum,
+    IsIn,
     ValidateNested,
     Min,
     Max,
     ArrayMinSize,
+    ArrayMaxSize,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { BacktestService, PoolType, StrategyType } from './backtest.service';
@@ -60,6 +62,56 @@ class BacktestAllocationDto {
     @IsOptional()
     @IsEnum(PoolType)
     poolType?: PoolType;
+}
+
+class PriceRangeDto {
+    @ApiProperty({ example: 0.8, description: 'Min price ratio for concentrated liquidity range' })
+    @IsNumber()
+    @Min(0.01)
+    min: number;
+
+    @ApiProperty({ example: 1.2, description: 'Max price ratio for concentrated liquidity range' })
+    @IsNumber()
+    @Min(0.01)
+    max: number;
+}
+
+class StrategyStepDto {
+    @ApiProperty({ example: 'k7x2m9abc', description: 'Unique step ID' })
+    @IsString()
+    id: string;
+
+    @ApiProperty({
+        example: 'stake',
+        enum: ['stake', 'farm', 'compound', 'borrow', 'repay', 'swap', 'withdraw'],
+        description: 'Action type for this step',
+    })
+    @IsIn(['stake', 'farm', 'compound', 'borrow', 'repay', 'swap', 'withdraw'])
+    action: 'stake' | 'farm' | 'compound' | 'borrow' | 'repay' | 'swap' | 'withdraw';
+
+    @ApiProperty({ example: 'blp_farm', description: 'Protocol for this step' })
+    @IsString()
+    protocol: string;
+
+    @ApiProperty({ example: 'DOT', description: 'Asset for this step' })
+    @IsString()
+    asset: string;
+
+    @ApiProperty({ example: 100, description: 'Percentage of capital for this step' })
+    @IsNumber()
+    @Min(0)
+    @Max(100)
+    percentage: number;
+
+    @ApiProperty({ example: 'polkadot', required: false, description: 'Optional chain name' })
+    @IsOptional()
+    @IsString()
+    chain?: string;
+
+    @ApiProperty({ example: 'Stake DOT for rewards', required: false, description: 'Optional description' })
+    @IsOptional()
+    @IsString()
+    description?: string;
 }
 
 class RunBacktestDto {
@@ -143,6 +195,18 @@ class RunBacktestDto {
     compoundFrequencyDays?: number;
 
     @ApiProperty({
+        example: 'weekly',
+        required: false,
+        enum: ['daily', 'weekly', 'monthly'],
+        description:
+            'Compound frequency as string. Maps to compoundFrequencyDays: daily=1, weekly=7, monthly=30.',
+    })
+    @IsOptional()
+    @IsString()
+    @IsIn(['daily', 'weekly', 'monthly'])
+    compoundFrequency?: string;
+
+    @ApiProperty({
         example: 0.5,
         required: false,
         description:
@@ -183,6 +247,75 @@ class RunBacktestDto {
     @Min(0)
     @Max(5)
     slippageTolerancePercent?: number;
+
+    // ─── Pro Mode fields ─────────────────────────────────────────────────────
+
+    @ApiProperty({
+        example: 15.5,
+        required: false,
+        description: '[Pro Mode] Override historical APY with a manual value (%)',
+    })
+    @IsOptional()
+    @IsNumber()
+    @Min(0)
+    baseApyOverride?: number;
+
+    @ApiProperty({
+        example: 100,
+        required: false,
+        description: '[Pro Mode] Reinvestment rate 0-100%. Overrides isCompound when present.',
+    })
+    @IsOptional()
+    @IsNumber()
+    @Min(0)
+    @Max(100)
+    reinvestmentRate?: number;
+
+    @ApiProperty({
+        example: 'medium',
+        required: false,
+        enum: ['low', 'medium', 'high'],
+        description: '[Pro Mode] Volatility assumption for IL calculation.',
+    })
+    @IsOptional()
+    @IsIn(['low', 'medium', 'high'])
+    volatilityAssumption?: 'low' | 'medium' | 'high';
+
+    @ApiProperty({
+        example: 25,
+        required: false,
+        description: '[Pro Mode] Max acceptable IL (1-50%). Triggers early termination if exceeded.',
+    })
+    @IsOptional()
+    @IsNumber()
+    @Min(1)
+    @Max(50)
+    maxAcceptableIl?: number;
+
+    @ApiProperty({
+        example: { min: 0.8, max: 1.2 },
+        required: false,
+        description: '[Pro Mode] Concentrated liquidity price range.',
+    })
+    @IsOptional()
+    @ValidateNested()
+    @Type(() => PriceRangeDto)
+    priceRange?: PriceRangeDto;
+
+    @ApiProperty({
+        type: [StrategyStepDto],
+        required: false,
+        description: '[Pro Mode] Multi-step yield loop strategy (max 5 steps).',
+        example: [
+            { id: 'a1b2c3', action: 'stake', protocol: 'blp_farm', asset: 'DOT', percentage: 100 },
+        ],
+    })
+    @IsOptional()
+    @IsArray()
+    @ArrayMaxSize(5)
+    @ValidateNested({ each: true })
+    @Type(() => StrategyStepDto)
+    steps?: StrategyStepDto[];
 }
 
 // ─── Extra DTOs ──────────────────────────────────────────────────────────────
